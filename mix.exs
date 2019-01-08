@@ -53,7 +53,7 @@ defmodule EctoSQL.MixProject do
       {:db_connection, "~> 2.0"},
       {:postgrex, "~> 0.14.0", optional: true},
       {:mariaex, "~> 0.9.1", optional: true},
-      {:tds, "~> 2.0", path: "../../lhn/elixir/tds", optional: true},
+      {:tds, "~> 2.0", optional: true},
 
       # Bring something in for JSON during tests
       {:jason, ">= 0.0.0", only: :test},
