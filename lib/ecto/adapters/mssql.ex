@@ -102,9 +102,9 @@ defmodule Ecto.Adapters.MsSql do
         NaiveDateTime.from_erl({date, {h, m, s}})
       ms > 999999 ->
         rms = Integer.floor_div(ms, 10)
-        NaiveDateTime.from_erl!({date, {h, m, s}}, {rms,  6})
+        NaiveDateTime.from_erl({date, {h, m, s}}, {rms,  6})
       true ->
-        NaiveDateTime.from_erl!({date, {h, m, s}}, {ms,  6})
+        NaiveDateTime.from_erl({date, {h, m, s}}, {ms,  6})
     end
   end
 
