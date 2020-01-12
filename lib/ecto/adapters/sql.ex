@@ -1,20 +1,3 @@
-defmodule Telemetry do
-  # TODO: Remove this deprecated module.
-  @moduledoc false
-
-  def attach(name, event, mod, fun, config) do
-    IO.warn "Telemetry.attach(name, event, mod, fun, config) is deprecated in favor of " <>
-              ":telemetry.attach(name, event, &mod.fun/4, config)"
-    :telemetry.attach(name, event, &apply(mod, fun, [&1, &2, &3, &4]), config)
-  end
-
-  def attach_many(name, events, mod, fun, config) do
-    IO.warn "Telemetry.attach_many(name, events, mod, fun, config) is deprecated in favor of " <>
-              ":telemetry.attach_many(name, events, &mod.fun/4, config)"
-    :telemetry.attach_many(name, events, &apply(mod, fun, [&1, &2, &3, &4]), config)
-  end
-end
-
 defmodule Ecto.Adapters.SQL do
   @moduledoc """
   This application provides functionality for working with
@@ -24,8 +7,8 @@ defmodule Ecto.Adapters.SQL do
 
   By default, we support the following adapters:
 
-    * `Ecto.Adapters.Postgres`
-    * `Ecto.Adapters.MySQL`
+    * `Ecto.Adapters.Postgres` for Postgres
+    * `Ecto.Adapters.MyXQL` for MySQL
 
   ## Migrations
 
@@ -82,6 +65,8 @@ defmodule Ecto.Adapters.SQL do
 
   """
 
+  require Logger
+
   @doc false
   defmacro __using__(opts) do
     quote do
@@ -117,16 +102,16 @@ defmodule Ecto.Adapters.SQL do
       end
 
       @impl true
-      def loaders({:embed, _} = type, _), do: [&Ecto.Adapters.SQL.load_embed(type, &1)]
-      def loaders({:map, _} = type, _),   do: [&Ecto.Adapters.SQL.load_embed(type, &1)]
-      def loaders(:binary_id, type),      do: [Ecto.UUID, type]
-      def loaders(_, type),               do: [type]
+      def loaders({:embed, _}, type), do: [&Ecto.Adapters.SQL.load_embed(type, &1)]
+      def loaders({:map, _}, type),   do: [&Ecto.Adapters.SQL.load_embed(type, &1)]
+      def loaders(:binary_id, type),  do: [Ecto.UUID, type]
+      def loaders(_, type),           do: [type]
 
       @impl true
-      def dumpers({:embed, _} = type, _), do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
-      def dumpers({:map, _} = type, _),   do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
-      def dumpers(:binary_id, type),      do: [type, Ecto.UUID]
-      def dumpers(_, type),               do: [type]
+      def dumpers({:embed, _}, type), do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
+      def dumpers({:map, _}, type),   do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
+      def dumpers(:binary_id, type),  do: [type, Ecto.UUID]
+      def dumpers(_, type),           do: [type]
 
       ## Query
 
@@ -219,7 +204,7 @@ defmodule Ecto.Adapters.SQL do
 
       defoverridable [prepare: 2, execute: 5, insert: 6, update: 6, delete: 4, insert_all: 7,
                       execute_ddl: 3, loaders: 2, dumpers: 2, autogenerate: 1,
-                      ensure_all_started: 2, lock_for_migrations: 4]
+                      ensure_all_started: 2, lock_for_migrations: 4, __before_compile__: 1]
     end
   end
 
@@ -279,8 +264,6 @@ defmodule Ecto.Adapters.SQL do
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for a query to finish,
-      `:infinity` will wait indefinitely (default: 15_000)
     * `:log` - When false, does not log the query
     * `:max_rows` - The number of rows to load from the database as we stream
 
@@ -326,8 +309,6 @@ defmodule Ecto.Adapters.SQL do
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for a query to finish,
-      `:infinity` will wait indefinitely. (default: 15_000)
     * `:log` - When false, does not log the query
 
   ## Examples
@@ -341,14 +322,14 @@ defmodule Ecto.Adapters.SQL do
       {:ok, %{rows: [[42]], num_rows: 1}}
 
   """
-  @spec query(Ecto.Repo.t | Ecto.Adapter.adapter_meta, String.t, [term], Keyword.t) ::
+  @spec query(pid() | Ecto.Repo.t | Ecto.Adapter.adapter_meta, String.t, [term], Keyword.t) ::
               {:ok, %{:rows => nil | [[term] | binary],
                       :num_rows => non_neg_integer,
                       optional(atom) => any}}
               | {:error, Exception.t}
   def query(repo, sql, params \\ [], opts \\ [])
 
-  def query(repo, sql, params, opts) when is_atom(repo) do
+  def query(repo, sql, params, opts) when is_atom(repo) or is_pid(repo) do
     query(Ecto.Adapter.lookup_meta(repo), sql, params, opts)
   end
 
@@ -371,6 +352,19 @@ defmodule Ecto.Adapters.SQL do
 
   defp put_source(opts, _) do
     opts
+  end
+
+  @doc """
+  Check if the given `table` exists.
+
+  Returns `true` if the `table` exists in the `repo`, otherwise `false`.
+  The table is checked against the current database/schema in the connection.
+  """
+  @spec table_exists?(Ecto.Repo.t, table :: String.t) :: boolean
+  def table_exists?(repo, table) when is_atom(repo) do
+    %{sql: sql} = adapter_meta = Ecto.Adapter.lookup_meta(repo)
+    {query, params} = sql.table_exists_query(table)
+    query!(adapter_meta, query, params, []).num_rows != 0
   end
 
   ## Callbacks
@@ -408,7 +402,7 @@ defmodule Ecto.Adapters.SQL do
       See `Ecto.Adapters.SQL.query/4` for more information.
       """
       def query(sql, params \\ [], opts \\ []) do
-        Ecto.Adapters.SQL.query(__MODULE__, sql, params, opts)
+        Ecto.Adapters.SQL.query(get_dynamic_repo(), sql, params, opts)
       end
 
       @doc """
@@ -417,7 +411,7 @@ defmodule Ecto.Adapters.SQL do
       See `Ecto.Adapters.SQL.query!/4` for more information.
       """
       def query!(sql, params \\ [], opts \\ []) do
-        Ecto.Adapters.SQL.query!(__MODULE__, sql, params, opts)
+        Ecto.Adapters.SQL.query!(get_dynamic_repo(), sql, params, opts)
       end
 
       @doc """
@@ -426,17 +420,18 @@ defmodule Ecto.Adapters.SQL do
       See `Ecto.Adapters.SQL.to_sql/3` for more information.
       """
       def to_sql(operation, queryable) do
-        Ecto.Adapters.SQL.to_sql(operation, __MODULE__, queryable)
+        Ecto.Adapters.SQL.to_sql(operation, get_dynamic_repo(), queryable)
       end
     end
   end
 
   @doc false
   def ensure_all_started(driver, _config, type) do
-    with {:ok, from_driver} <- Application.ensure_all_started(driver, type),
-         # We always return the adapter to force it to be restarted if necessary
-         do: {:ok, List.delete(from_driver, driver) ++ [driver]}
+    Application.ensure_all_started(driver, type)
   end
+
+  @pool_opts [:timeout, :pool, :pool_size, :migration_lock] ++
+               [:queue_target, :queue_interval, :ownership_timeout]
 
   @doc false
   def init(connection, driver, config) do
@@ -454,14 +449,12 @@ defmodule Ecto.Adapters.SQL do
       """
     end
 
-    # TODO: Remove deprecated loggers configuration
-    loggers = Keyword.get(config, :loggers, [])
     log = Keyword.get(config, :log, :debug)
     telemetry_prefix = Keyword.fetch!(config, :telemetry_prefix)
-    telemetry = {config[:repo], log, loggers, telemetry_prefix ++ [:query]}
+    telemetry = {config[:repo], log, telemetry_prefix ++ [:query]}
 
     config = adapter_config(config)
-    opts = Keyword.take(config, [:timeout, :pool, :pool_size, :migration_lock])
+    opts = Keyword.take(config, @pool_opts)
     meta = %{telemetry: telemetry, sql: connection, opts: opts}
     {:ok, connection.child_spec(config), meta}
   end
@@ -503,9 +496,14 @@ defmodule Ecto.Adapters.SQL do
         load_embed(type, value)
 
       type, value ->
-        case Ecto.Type.cast(type, value) do
-          {:ok, _} = ok -> ok
-          _ -> :error
+        case Ecto.Type.embed_as(type, :json) do
+          :self ->
+            case Ecto.Type.cast(type, value) do
+              {:ok, _} = ok -> ok
+              _ -> :error
+            end
+          :dump ->
+            Ecto.Type.load(type, value)
         end
     end)
   end
@@ -513,8 +511,14 @@ defmodule Ecto.Adapters.SQL do
   @doc false
   def dump_embed(type, value) do
     Ecto.Type.dump(type, value, fn
-      {:embed, _} = type, value -> dump_embed(type, value)
-      _type, value -> {:ok, value}
+      {:embed, _} = type, value ->
+        dump_embed(type, value)
+
+      type, value ->
+        case Ecto.Type.embed_as(type, :json) do
+          :self -> {:ok, value}
+          :dump -> Ecto.Type.dump(type, value)
+        end
     end)
   end
 
@@ -526,6 +530,9 @@ defmodule Ecto.Adapters.SQL do
     {_, conflict_params, _} = on_conflict
     {rows, params} = unzip_inserts(header, rows)
     sql = conn.insert(prefix, source, header, rows, on_conflict, returning)
+
+    cache_statement = "ecto_insert_all_#{source}"
+    opts = [{:cache_statement, cache_statement} | opts]
 
     %{num_rows: num, rows: rows} =
       query!(adapter_meta, sql, Enum.reverse(params) ++ conflict_params, opts)
@@ -763,11 +770,12 @@ defmodule Ecto.Adapters.SQL do
     [log: &log(telemetry, params, &1, opts)] ++ opts
   end
 
-  defp log({repo, log, loggers, event_name}, params, entry, opts) do
+  defp log({repo, log, event_name}, params, entry, opts) do
     %{
       connection_time: query_time,
       decode_time: decode_time,
       pool_time: queue_time,
+      idle_time: idle_time,
       result: result,
       query: query
     } = entry
@@ -775,38 +783,115 @@ defmodule Ecto.Adapters.SQL do
     source = Keyword.get(opts, :source)
     query_string = String.Chars.to_string(query)
 
-    entry = %{
+    params =
+      Enum.map(params, fn
+        %Ecto.Query.Tagged{value: value} -> value
+        value -> value
+      end)
+
+    acc =
+      if idle_time, do: [idle_time: idle_time], else: []
+
+    measurements =
+      log_measurements(
+        [query_time: query_time, decode_time: decode_time, queue_time: queue_time],
+        0,
+        acc
+      )
+
+    metadata = %{
       type: :ecto_sql_query,
       repo: repo,
-      query_time: query_time,
-      decode_time: decode_time,
-      queue_time: queue_time,
       result: log_result(result),
       params: params,
       query: query_string,
       source: source
     }
 
-    total = (query_time || 0) + (decode_time || 0) + (queue_time || 0)
-
     if event_name = Keyword.get(opts, :telemetry_event, event_name) do
-      :telemetry.execute(event_name, total, entry)
+      :telemetry.execute(event_name, measurements, metadata)
     end
 
     case Keyword.get(opts, :log, log) do
-      true -> Ecto.LogEntry.log(entry, log, ansi_color: sql_color(query_string))
-      false -> :ok
-      level -> Ecto.LogEntry.log(entry, level, ansi_color: sql_color(query_string))
+      true ->
+        Logger.log(
+          log,
+          fn -> log_iodata(measurements, metadata) end,
+          ansi_color: sql_color(query_string)
+        )
+
+      false ->
+        :ok
+
+      level ->
+        Logger.log(
+          level,
+          fn -> log_iodata(measurements, metadata) end,
+          ansi_color: sql_color(query_string)
+        )
     end
 
-    Enum.reduce(loggers, entry, fn
-      mod, acc when is_atom(mod) -> mod.log(acc)
-      {mod, fun, args}, acc -> apply(mod, fun, [acc | args])
-    end)
+    :ok
   end
+
+  defp log_measurements([{_, nil} | rest], total, acc),
+    do: log_measurements(rest, total, acc)
+
+  defp log_measurements([{key, value} | rest], total, acc),
+    do: log_measurements(rest, total + value, [{key, value} | acc])
+
+  defp log_measurements([], total, acc),
+    do: Map.new([total_time: total] ++ acc)
 
   defp log_result({:ok, _query, res}), do: {:ok, res}
   defp log_result(other), do: other
+
+  defp log_iodata(measurements, metadata) do
+    %{
+      params: params,
+      query: query,
+      result: result,
+      source: source
+    } = metadata
+
+    [
+      "QUERY",
+      ?\s,
+      log_ok_error(result),
+      log_ok_source(source),
+      log_time("db", measurements, :query_time, true),
+      log_time("decode", measurements, :decode_time, false),
+      log_time("queue", measurements, :queue_time, false),
+      log_time("idle", measurements, :idle_time, true),
+      ?\n,
+      query,
+      ?\s,
+      inspect(params, charlists: false)
+    ]
+  end
+
+  defp log_ok_error({:ok, _res}), do: "OK"
+  defp log_ok_error({:error, _err}), do: "ERROR"
+
+  defp log_ok_source(nil), do: ""
+  defp log_ok_source(source), do: " source=#{inspect(source)}"
+
+  defp log_time(label, measurements, key, force) do
+    case measurements do
+      %{^key => time} ->
+        us = System.convert_time_unit(time, :native, :microsecond)
+        ms = div(us, 100) / 10
+
+        if force or ms > 0 do
+          [?\s, label, ?=, :io_lib_format.fwrite_g(ms), ?m, ?s]
+        else
+          []
+        end
+
+      %{} ->
+        []
+    end
+  end
 
   ## Connection helpers
 

@@ -100,13 +100,14 @@ if Code.ensure_loaded?(Postgrex) do
       Postgrex.stream(conn, sql, params, opts)
     end
 
-    alias Ecto.Query.{BooleanExpr, JoinExpr, QueryExpr}
+    alias Ecto.Query.{BooleanExpr, JoinExpr, QueryExpr, WithExpr}
 
     @impl true
     def all(query) do
       sources = create_names(query)
       {select_distinct, order_by_distinct} = distinct(query.distinct, sources, query)
 
+      cte = cte(query, sources)
       from = from(query, sources)
       select = select(query, select_distinct, sources)
       join = join(query, sources)
@@ -120,12 +121,13 @@ if Code.ensure_loaded?(Postgrex) do
       offset = offset(query, sources)
       lock = lock(query.lock)
 
-      [select, from, join, where, group_by, having, window, combinations, order_by, limit, offset | lock]
+      [cte, select, from, join, where, group_by, having, window, combinations, order_by, limit, offset | lock]
     end
 
     @impl true
     def update_all(%{from: %{source: source}} = query, prefix \\ nil) do
       sources = create_names(query)
+      cte = cte(query, sources)
       {from, name} = get_source(query, sources, 0, source)
 
       prefix = prefix || ["UPDATE ", from, " AS ", name | " SET "]
@@ -133,18 +135,19 @@ if Code.ensure_loaded?(Postgrex) do
       {join, wheres} = using_join(query, :update_all, "FROM", sources)
       where = where(%{query | wheres: wheres ++ query.wheres}, sources)
 
-      [prefix, fields, join, where | returning(query, sources)]
+      [cte, prefix, fields, join, where | returning(query, sources)]
     end
 
     @impl true
     def delete_all(%{from: from} = query) do
       sources = create_names(query)
+      cte = cte(query, sources)
       {from, name} = get_source(query, sources, 0, from)
 
       {join, wheres} = using_join(query, :delete_all, "USING", sources)
       where = where(%{query | wheres: wheres ++ query.wheres}, sources)
 
-      ["DELETE FROM ", from, " AS ", name, join, where | returning(query, sources)]
+      [cte, "DELETE FROM ", from, " AS ", name, join, where | returning(query, sources)]
     end
 
     @impl true
@@ -269,6 +272,14 @@ if Code.ensure_loaded?(Postgrex) do
       do: "TRUE"
     defp select_fields(fields, sources, query) do
       intersperse_map(fields, ", ", fn
+        {:&, _, [idx]} ->
+          case elem(sources, idx) do
+            {source, _, nil} ->
+              error!(query, "PostgreSQL does not support selecting all fields from #{source} without a schema. " <>
+                            "Please specify a schema or specify exactly which fields you want to select")
+            {_, source, _} ->
+              source
+          end
         {key, value} ->
           [expr(value, sources, query), " AS " | quote_name(key)]
         value ->
@@ -294,6 +305,21 @@ if Code.ensure_loaded?(Postgrex) do
       {from, name} = get_source(query, sources, 0, source)
       [" FROM ", from, " AS " | name]
     end
+
+    defp cte(%{with_ctes: %WithExpr{recursive: recursive, queries: [_ | _] = queries}} = query, sources) do
+      recursive_opt = if recursive, do: "RECURSIVE ", else: ""
+      ctes = intersperse_map(queries, ", ", &cte_expr(&1, sources, query))
+      ["WITH ", recursive_opt, ctes, " "]
+    end
+
+    defp cte(%{with_ctes: _}, _), do: []
+
+    defp cte_expr({name, cte}, sources, query) do
+      [quote_name(name), " AS ", cte_query(cte, sources, query)]
+    end
+
+    defp cte_query(%Ecto.Query{} = query, _, _), do: ["(", all(query), ")"]
+    defp cte_query(%QueryExpr{expr: expr}, sources, query), do: expr(expr, sources, query)
 
     defp update_fields(%{updates: updates} = query, sources) do
       for(%{expr: expr} <- updates,
@@ -534,12 +560,12 @@ if Code.ensure_loaded?(Postgrex) do
     end
 
     defp expr({:datetime_add, _, [datetime, count, interval]}, sources, query) do
-      [expr(datetime, sources, query), "::timestamp + ",
+      [expr(datetime, sources, query), type_unless_typed(datetime, "timestamp"), " + ",
        interval(count, interval, sources, query)]
     end
 
     defp expr({:date_add, _, [date, count, interval]}, sources, query) do
-      [?(, expr(date, sources, query), "::date + ",
+      [?(, expr(date, sources, query), type_unless_typed(date, "date"), " + ",
        interval(count, interval, sources, query) | ")::date"]
     end
 
@@ -613,10 +639,13 @@ if Code.ensure_loaded?(Postgrex) do
       [Float.to_string(literal) | "::float"]
     end
 
-    defp tagged_to_db({:array, type}), do: [tagged_to_db(type), ?[, ?]]
+    defp type_unless_typed(%Ecto.Query.Tagged{}, _type), do: []
+    defp type_unless_typed(_, type), do: [?:, ?: | type]
+
     # Always use the largest possible type for integers
     defp tagged_to_db(:id), do: "bigint"
     defp tagged_to_db(:integer), do: "bigint"
+    defp tagged_to_db({:array, type}), do: [tagged_to_db(type), ?[, ?]]
     defp tagged_to_db(type), do: ecto_to_db(type)
 
     defp interval(count, interval, _sources, _query) when is_integer(count) do
@@ -734,7 +763,7 @@ if Code.ensure_loaded?(Postgrex) do
                   ?\s, ?(, fields, ?),
                   if_do(index.where, [" WHERE ", to_string(index.where)])]]
 
-      queries ++ comments_on("INDEX", quote_name(index.name), index.comment)
+      queries ++ comments_on("INDEX", quote_table(index.prefix, index.name), index.comment)
     end
 
     def execute_ddl({:create_if_not_exists, %Index{} = index}) do
@@ -797,6 +826,11 @@ if Code.ensure_loaded?(Postgrex) do
 
         {ddl_log_level(severity), message, []}
       end
+    end
+
+    @impl true
+    def table_exists_query(table) do
+      {"SELECT true FROM information_schema.tables WHERE table_name = $1 AND table_schema = current_schema() LIMIT 1", [table]}
     end
 
     # From https://www.postgresql.org/docs/9.3/static/protocol-error-fields.html.
@@ -869,6 +903,16 @@ if Code.ensure_loaded?(Postgrex) do
        column_options(type, opts)]
     end
 
+    defp column_change(table, {:add_if_not_exists, name, %Reference{} = ref, opts}) do
+      ["ADD COLUMN IF NOT EXISTS ", quote_name(name), ?\s, reference_column_type(ref.type, opts),
+       column_options(ref.type, opts), reference_expr(ref, table, name)]
+    end
+
+    defp column_change(_table, {:add_if_not_exists, name, type, opts}) do
+      ["ADD COLUMN IF NOT EXISTS ", quote_name(name), ?\s, column_type(type, opts),
+       column_options(type, opts)]
+    end
+
     defp column_change(table, {:modify, name, %Reference{} = ref, opts}) do
       [drop_constraint_expr(opts[:from], table, name), "ALTER COLUMN ", quote_name(name), " TYPE ", reference_column_type(ref.type, opts),
        constraint_expr(ref, table, name), modify_null(name, opts), modify_default(name, ref.type, opts)]
@@ -884,6 +928,11 @@ if Code.ensure_loaded?(Postgrex) do
       [drop_constraint_expr(ref, table, name), "DROP COLUMN ", quote_name(name)]
     end
     defp column_change(_table, {:remove, name, _type, _opts}), do: ["DROP COLUMN ", quote_name(name)]
+
+    defp column_change(table, {:remove_if_exists, name, %Reference{} = ref}) do
+      [drop_constraint_if_exists_expr(ref, table, name), "DROP COLUMN IF EXISTS ", quote_name(name)]
+    end
+    defp column_change(_table, {:remove_if_exists, name, _type}), do: ["DROP COLUMN IF EXISTS ", quote_name(name)]
 
     defp modify_null(name, opts) do
       case Keyword.get(opts, :null) do
@@ -1004,6 +1053,11 @@ if Code.ensure_loaded?(Postgrex) do
     defp drop_constraint_expr(%Reference{} = ref, table, name),
       do: ["DROP CONSTRAINT ", reference_name(ref, table, name), ", "]
     defp drop_constraint_expr(_, _, _),
+      do: []
+
+    defp drop_constraint_if_exists_expr(%Reference{} = ref, table, name),
+      do: ["DROP CONSTRAINT IF EXISTS ", reference_name(ref, table, name), ", "]
+    defp drop_constraint_if_exists_expr(_, _, _),
       do: []
 
     defp reference_name(%Reference{name: nil}, table, column),

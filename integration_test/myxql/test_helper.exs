@@ -9,7 +9,7 @@ Code.require_file "../support/repo.exs", __DIR__
 
 # Configure MySQL connection
 Application.put_env(:ecto_sql, :mysql_test_url,
-  "ecto://" <> (System.get_env("MYSQL_URL") || "root@localhost")
+  "ecto://" <> (System.get_env("MYSQL_URL") || "root@127.0.0.1")
 )
 
 # Pool repo for async, safe tests
@@ -17,10 +17,12 @@ alias Ecto.Integration.TestRepo
 
 Application.put_env(:ecto_sql, TestRepo,
   url: Application.get_env(:ecto_sql, :mysql_test_url) <> "/ecto_test",
-  pool: Ecto.Adapters.SQL.Sandbox)
+  pool: Ecto.Adapters.SQL.Sandbox,
+  show_sensitive_data_on_connection_error: true
+)
 
 defmodule Ecto.Integration.TestRepo do
-  use Ecto.Integration.Repo, otp_app: :ecto_sql, adapter: Ecto.Adapters.MySQL
+  use Ecto.Integration.Repo, otp_app: :ecto_sql, adapter: Ecto.Adapters.MyXQL
 
   def create_prefix(prefix) do
     "create database #{prefix}"
@@ -39,16 +41,18 @@ end
 alias Ecto.Integration.PoolRepo
 
 Application.put_env(:ecto_sql, PoolRepo,
-  adapter: Ecto.Adapters.MySQL,
+  adapter: Ecto.Adapters.MyXQL,
   url: Application.get_env(:ecto_sql, :mysql_test_url) <> "/ecto_test",
-  pool_size: 10)
+  pool_size: 10,
+  show_sensitive_data_on_connection_error: true
+)
 
 defmodule Ecto.Integration.PoolRepo do
-  use Ecto.Integration.Repo, otp_app: :ecto_sql, adapter: Ecto.Adapters.MySQL
+  use Ecto.Integration.Repo, otp_app: :ecto_sql, adapter: Ecto.Adapters.MyXQL
 end
 
 # Load support files
-ecto = Mix.Project.deps_paths[:ecto]
+ecto = Mix.Project.deps_paths()[:ecto]
 Code.require_file "#{ecto}/integration_test/support/schemas.exs", __DIR__
 Code.require_file "../support/migration.exs", __DIR__
 
@@ -60,11 +64,11 @@ defmodule Ecto.Integration.Case do
   end
 end
 
-{:ok, _} = Ecto.Adapters.MySQL.ensure_all_started(TestRepo.config(), :temporary)
+{:ok, _} = Ecto.Adapters.MyXQL.ensure_all_started(TestRepo.config(), :temporary)
 
 # Load up the repository, start it, and run migrations
-_   = Ecto.Adapters.MySQL.storage_down(TestRepo.config)
-:ok = Ecto.Adapters.MySQL.storage_up(TestRepo.config)
+_   = Ecto.Adapters.MyXQL.storage_down(TestRepo.config())
+:ok = Ecto.Adapters.MyXQL.storage_up(TestRepo.config())
 
 {:ok, _pid} = TestRepo.start_link()
 {:ok, _pid} = PoolRepo.start_link()

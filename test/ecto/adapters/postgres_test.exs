@@ -81,11 +81,18 @@ defmodule Ecto.Adapters.PostgresTest do
     query = "posts" |> select([r], r.x) |> plan()
     assert all(query) == ~s{SELECT p0."x" FROM "posts" AS p0}
 
+    query = "posts" |> select([r], fragment("?", r)) |> plan()
+    assert all(query) == ~s{SELECT p0 FROM "posts" AS p0}
+
     query = "Posts" |> select([:x]) |> plan()
     assert all(query) == ~s{SELECT P0."x" FROM "Posts" AS P0}
 
     query = "0posts" |> select([:x]) |> plan()
     assert all(query) == ~s{SELECT t0."x" FROM "0posts" AS t0}
+
+    assert_raise Ecto.QueryError, ~r"PostgreSQL does not support selecting all fields from \"posts\" without a schema", fn ->
+      all from(p in "posts", select: p) |> plan()
+    end
   end
 
   test "from with subquery" do
@@ -94,6 +101,137 @@ defmodule Ecto.Adapters.PostgresTest do
 
     query = subquery("posts" |> select([r], %{x: r.x, z: r.y})) |> select([r], r) |> plan()
     assert all(query) == ~s{SELECT s0."x", s0."z" FROM (SELECT p0."x" AS "x", p0."y" AS "z" FROM "posts" AS p0) AS s0}
+  end
+
+  test "CTE" do
+    initial_query =
+      "categories"
+      |> where([c], is_nil(c.parent_id))
+      |> select([c], %{id: c.id, depth: fragment("1")})
+
+    iteration_query =
+      "categories"
+      |> join(:inner, [c], t in "tree", on: t.id == c.parent_id)
+      |> select([c, t], %{id: c.id, depth: fragment("? + 1", t.depth)})
+
+    cte_query = initial_query |> union_all(^iteration_query)
+
+    query =
+      Schema
+      |> recursive_ctes(true)
+      |> with_cte("tree", as: ^cte_query)
+      |> join(:inner, [r], t in "tree", on: t.id == r.category_id)
+      |> select([r, t], %{x: r.x, category_id: t.id, depth: type(t.depth, :integer)})
+      |> plan()
+
+    assert all(query) ==
+      ~s{WITH RECURSIVE "tree" AS } <>
+      ~s{(SELECT c0."id" AS "id", 1 AS "depth" FROM "categories" AS c0 WHERE (c0."parent_id" IS NULL) } <>
+      ~s{UNION ALL } <>
+      ~s{(SELECT c0."id", t1."depth" + 1 FROM "categories" AS c0 } <>
+      ~s{INNER JOIN "tree" AS t1 ON t1."id" = c0."parent_id")) } <>
+      ~s{SELECT s0."x", t1."id", t1."depth"::bigint } <>
+      ~s{FROM "schema" AS s0 } <>
+      ~s{INNER JOIN "tree" AS t1 ON t1."id" = s0."category_id"}
+  end
+
+  @raw_sql_cte """
+  SELECT * FROM categories WHERE c.parent_id IS NULL
+  UNION ALL
+  SELECT * FROM categories AS c, category_tree AS ct WHERE ct.id = c.parent_id
+  """
+
+  test "reference CTE in union" do
+    comments_scope_query =
+      "comments"
+      |> where([c], is_nil(c.deleted_at))
+      |> select([c], %{entity_id: c.entity_id, text: c.text})
+
+    posts_query =
+      "posts"
+      |> join(:inner, [p], c in "comments_scope", on: c.entity_id == p.guid)
+      |> select([p, c], [p.title, c.text])
+
+    videos_query =
+      "videos"
+      |> join(:inner, [v], c in "comments_scope", on: c.entity_id == v.guid)
+      |> select([v, c], [v.title, c.text])
+
+    query =
+      posts_query
+      |> union_all(^videos_query)
+      |> with_cte("comments_scope", as: ^comments_scope_query)
+      |> plan()
+
+    assert all(query) ==
+      ~s{WITH "comments_scope" AS (} <>
+      ~s{SELECT c0."entity_id" AS "entity_id", c0."text" AS "text" } <>
+      ~s{FROM "comments" AS c0 WHERE (c0."deleted_at" IS NULL)) } <>
+      ~s{SELECT p0."title", c1."text" } <>
+      ~s{FROM "posts" AS p0 } <>
+      ~s{INNER JOIN "comments_scope" AS c1 ON c1."entity_id" = p0."guid" } <>
+      ~s{UNION ALL } <>
+      ~s{(SELECT v0."title", c1."text" } <>
+      ~s{FROM "videos" AS v0 } <>
+      ~s{INNER JOIN "comments_scope" AS c1 ON c1."entity_id" = v0."guid")}
+  end
+
+  test "fragment CTE" do
+    query =
+      Schema
+      |> recursive_ctes(true)
+      |> with_cte("tree", as: fragment(@raw_sql_cte))
+      |> join(:inner, [p], c in "tree", on: c.id == p.category_id)
+      |> select([r], r.x)
+      |> plan()
+
+    assert all(query) ==
+      ~s{WITH RECURSIVE "tree" AS (#{@raw_sql_cte}) } <>
+      ~s{SELECT s0."x" } <>
+      ~s{FROM "schema" AS s0 } <>
+      ~s{INNER JOIN "tree" AS t1 ON t1."id" = s0."category_id"}
+  end
+
+  test "CTE update_all" do
+    cte_query =
+      from(x in Schema, order_by: [asc: :id], limit: 10, lock: "FOR UPDATE SKIP LOCKED", select: %{id: x.id})
+
+    query =
+      Schema
+      |> with_cte("target_rows", as: ^cte_query)
+      |> join(:inner, [row], target in "target_rows", on: target.id == row.id)
+      |> select([r, t], r)
+      |> update(set: [x: 123])
+      |> plan(:update_all)
+
+    assert update_all(query) ==
+      ~s{WITH "target_rows" AS } <>
+      ~s{(SELECT s0."id" AS "id" FROM "schema" AS s0 ORDER BY s0."id" LIMIT 10 FOR UPDATE SKIP LOCKED) } <>
+      ~s{UPDATE "schema" AS s0 } <>
+      ~s{SET "x" = 123 } <>
+      ~s{FROM "target_rows" AS t1 } <>
+      ~s{WHERE (t1."id" = s0."id") } <>
+      ~s{RETURNING s0."id", s0."x", s0."y", s0."z", s0."w"}
+  end
+
+  test "CTE delete_all" do
+    cte_query =
+      from(x in Schema, order_by: [asc: :id], limit: 10, lock: "FOR UPDATE SKIP LOCKED", select: %{id: x.id})
+
+    query =
+      Schema
+      |> with_cte("target_rows", as: ^cte_query)
+      |> join(:inner, [row], target in "target_rows", on: target.id == row.id)
+      |> select([r, t], r)
+      |> plan(:delete_all)
+
+    assert delete_all(query) ==
+      ~s{WITH "target_rows" AS } <>
+      ~s{(SELECT s0."id" AS "id" FROM "schema" AS s0 ORDER BY s0."id" LIMIT 10 FOR UPDATE SKIP LOCKED) } <>
+      ~s{DELETE FROM "schema" AS s0 } <>
+      ~s{USING "target_rows" AS t1 } <>
+      ~s{WHERE (t1."id" = s0."id") } <>
+      ~s{RETURNING s0."id", s0."x", s0."y", s0."z", s0."w"}
   end
 
   test "select" do
@@ -372,6 +510,14 @@ defmodule Ecto.Adapters.PostgresTest do
     assert all(query) == ~s{SELECT TRUE FROM "schema" AS s0 WHERE (s0."foo" = 123.0::float)}
   end
 
+  test "datetime_add" do
+    query = "schema" |> where([s], datetime_add(s.foo, 1, "month") > s.bar) |> select([], true) |> plan()
+    assert all(query) == ~s{SELECT TRUE FROM "schema" AS s0 WHERE (s0."foo"::timestamp + interval '1 month' > s0."bar")}
+
+    query = "schema" |> where([s], datetime_add(type(s.foo, :string), 1, "month") > s.bar) |> select([], true) |> plan()
+    assert all(query) == ~s{SELECT TRUE FROM "schema" AS s0 WHERE (s0."foo"::varchar + interval '1 month' > s0."bar")}
+  end
+
   test "tagged type" do
     query = Schema |> select([], type(^"601d74e4-a8d3-4b6e-8365-eddb4c893327", Ecto.UUID)) |> plan()
     assert all(query) == ~s{SELECT $1::uuid FROM "schema" AS s0}
@@ -457,10 +603,13 @@ defmodule Ecto.Adapters.PostgresTest do
   end
 
   test "interpolated values" do
-    union = "schema1" |> select([m], {m.id, ^true}) |> where([], fragment("?", ^3))
-    union_all = "schema2" |> select([m], {m.id, ^false}) |> where([], fragment("?", ^4))
+    cte1 = "schema1" |> select([m], %{id: m.id, smth: ^true}) |> where([], fragment("?", ^1))
+    union = "schema1" |> select([m], {m.id, ^true}) |> where([], fragment("?", ^5))
+    union_all = "schema2" |> select([m], {m.id, ^false}) |> where([], fragment("?", ^6))
 
     query = "schema"
+            |> with_cte("cte1", as: ^cte1)
+            |> with_cte("cte2", as: fragment("SELECT * FROM schema WHERE ?", ^2))
             |> select([m], {m.id, ^true})
             |> join(:inner, [], Schema2, on: fragment("?", ^true))
             |> join(:inner, [], Schema2, on: fragment("?", ^false))
@@ -468,22 +617,24 @@ defmodule Ecto.Adapters.PostgresTest do
             |> where([], fragment("?", ^false))
             |> having([], fragment("?", ^true))
             |> having([], fragment("?", ^false))
-            |> group_by([], fragment("?", ^1))
-            |> group_by([], fragment("?", ^2))
+            |> group_by([], fragment("?", ^3))
+            |> group_by([], fragment("?", ^4))
             |> union(^union)
             |> union_all(^union_all)
-            |> order_by([], fragment("?", ^5))
-            |> limit([], ^6)
-            |> offset([], ^7)
+            |> order_by([], fragment("?", ^7))
+            |> limit([], ^8)
+            |> offset([], ^9)
             |> plan()
 
     result =
-      "SELECT s0.\"id\", $1 FROM \"schema\" AS s0 INNER JOIN \"schema2\" AS s1 ON $2 " <>
-      "INNER JOIN \"schema2\" AS s2 ON $3 WHERE ($4) AND ($5) " <>
-      "GROUP BY $6, $7 HAVING ($8) AND ($9) " <>
-      "UNION (SELECT s0.\"id\", $10 FROM \"schema1\" AS s0 WHERE ($11)) " <>
-      "UNION ALL (SELECT s0.\"id\", $12 FROM \"schema2\" AS s0 WHERE ($13)) " <>
-      "ORDER BY $14 LIMIT $15 OFFSET $16"
+      "WITH \"cte1\" AS (SELECT s0.\"id\" AS \"id\", $1 AS \"smth\" FROM \"schema1\" AS s0 WHERE ($2)), " <>
+      "\"cte2\" AS (SELECT * FROM schema WHERE $3) " <>
+      "SELECT s0.\"id\", $4 FROM \"schema\" AS s0 INNER JOIN \"schema2\" AS s1 ON $5 " <>
+      "INNER JOIN \"schema2\" AS s2 ON $6 WHERE ($7) AND ($8) " <>
+      "GROUP BY $9, $10 HAVING ($11) AND ($12) " <>
+      "UNION (SELECT s0.\"id\", $13 FROM \"schema1\" AS s0 WHERE ($14)) " <>
+      "UNION ALL (SELECT s0.\"id\", $15 FROM \"schema2\" AS s0 WHERE ($16)) " <>
+      "ORDER BY $17 LIMIT $18 OFFSET $19"
 
     assert all(query) == String.trim(result)
   end
@@ -556,6 +707,10 @@ defmodule Ecto.Adapters.PostgresTest do
     query = from(m in Schema, update: [set: [x: 0]]) |> select([m], m) |> plan(:update_all)
     assert update_all(query) ==
            ~s{UPDATE "schema" AS s0 SET "x" = 0 RETURNING s0."id", s0."x", s0."y", s0."z", s0."w"}
+
+    query = from(m in Schema, update: [set: [x: ^1]]) |> where([m], m.x == ^2) |> select([m], m.x == ^3) |> plan(:update_all)
+    assert update_all(query) ==
+           ~s{UPDATE "schema" AS s0 SET "x" = $1 WHERE (s0."x" = $2) RETURNING s0."x" = $3}
   end
 
   test "update all array ops" do
@@ -1226,7 +1381,9 @@ defmodule Ecto.Adapters.PostgresTest do
   test "alter table" do
     alter = {:alter, table(:posts),
              [{:add, :title, :string, [default: "Untitled", size: 100, null: false]},
-              {:add, :author_id, %Reference{table: :author}, []},
+             {:add, :author_id, %Reference{table: :author}, []},
+             {:add_if_not_exists, :subtitle, :string, [size: 100, null: false]},
+             {:add_if_not_exists, :editor_id, %Reference{table: :editor}, []},
               {:modify, :price, :numeric, [precision: 8, scale: 2, null: true]},
               {:modify, :cost, :integer, [null: false, default: nil]},
               {:modify, :permalink_id, %Reference{table: :permalinks}, null: false},
@@ -1235,12 +1392,16 @@ defmodule Ecto.Adapters.PostgresTest do
               {:modify, :group_id, %Reference{table: :groups, column: :gid}, from: %Reference{table: :groups}},
               {:remove, :summary},
               {:remove, :body, :text, []},
-              {:remove, :space_id, %Reference{table: :author}, []}]}
+              {:remove, :space_id, %Reference{table: :author}, []},
+              {:remove_if_exists, :body, :text},
+              {:remove_if_exists, :space_id, %Reference{table: :author}}]}
 
     assert execute_ddl(alter) == ["""
     ALTER TABLE "posts"
     ADD COLUMN "title" varchar(100) DEFAULT 'Untitled' NOT NULL,
     ADD COLUMN "author_id" bigint CONSTRAINT "posts_author_id_fkey" REFERENCES "author"("id"),
+    ADD COLUMN IF NOT EXISTS "subtitle" varchar(100) NOT NULL,
+    ADD COLUMN IF NOT EXISTS "editor_id" bigint CONSTRAINT "posts_editor_id_fkey" REFERENCES "editor"("id"),
     ALTER COLUMN "price" TYPE numeric(8,2),
     ALTER COLUMN "price" DROP NOT NULL,
     ALTER COLUMN "cost" TYPE integer,
@@ -1258,7 +1419,10 @@ defmodule Ecto.Adapters.PostgresTest do
     DROP COLUMN "summary",
     DROP COLUMN "body",
     DROP CONSTRAINT "posts_space_id_fkey",
-    DROP COLUMN "space_id"
+    DROP COLUMN "space_id",
+    DROP COLUMN IF EXISTS "body",
+    DROP CONSTRAINT IF EXISTS "posts_space_id_fkey",
+    DROP COLUMN IF EXISTS "space_id"
     """ |> remove_newlines]
   end
 
@@ -1346,7 +1510,7 @@ defmodule Ecto.Adapters.PostgresTest do
     assert execute_ddl(create) == [remove_newlines("""
     CREATE INDEX "posts_category_id_permalink_index" ON "foo"."posts" ("category_id", "permalink")
     """),
-    ~s|COMMENT ON INDEX "posts_category_id_permalink_index" IS 'comment'|]
+    ~s|COMMENT ON INDEX "foo"."posts_category_id_permalink_index" IS 'comment'|]
   end
 
   test "create unique index" do
@@ -1366,19 +1530,22 @@ defmodule Ecto.Adapters.PostgresTest do
   end
 
   test "create index concurrently" do
-    create = {:create, index(:posts, [:permalink], concurrently: true)}
+    index = index(:posts, [:permalink])
+    create = {:create, %{index | concurrently: true}}
     assert execute_ddl(create) ==
       [~s|CREATE INDEX CONCURRENTLY "posts_permalink_index" ON "posts" ("permalink")|]
   end
 
   test "create unique index concurrently" do
-    create = {:create, index(:posts, [:permalink], concurrently: true, unique: true)}
+    index = index(:posts, [:permalink], unique: true)
+    create = {:create, %{index | concurrently: true}}
     assert execute_ddl(create) ==
       [~s|CREATE UNIQUE INDEX CONCURRENTLY "posts_permalink_index" ON "posts" ("permalink")|]
   end
 
   test "create index if not exists concurrently" do
-    create = {:create_if_not_exists, index(:posts, [:permalink], concurrently: true)}
+    index = index(:posts, [:permalink])
+    create = {:create_if_not_exists, %{index | concurrently: true}}
 
     assert_raise ArgumentError,
                  "concurrent index and create_if_not_exists is not supported by the Postgres adapter",
@@ -1402,7 +1569,8 @@ defmodule Ecto.Adapters.PostgresTest do
   end
 
   test "drop index concurrently" do
-    drop = {:drop, index(:posts, [:id], name: "posts$main", concurrently: true)}
+    index = index(:posts, [:id], name: "posts$main")
+    drop = {:drop, %{index | concurrently: true}}
     assert execute_ddl(drop) == [~s|DROP INDEX CONCURRENTLY "posts$main"|]
   end
 

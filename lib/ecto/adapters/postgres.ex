@@ -37,7 +37,6 @@ defmodule Ecto.Adapters.Postgres do
     * `:maintenance_database` - Specifies the name of the database to connect to when
       creating or dropping the database. Defaults to `"postgres"`
     * `:pool` - The connection pool module, defaults to `DBConnection.ConnectionPool`
-    * `:timeout` - The default timeout to use on queries, defaults to `15000`
     * `:ssl` - Set to true if ssl should be used (default: false)
     * `:ssl_opts` - A list of ssl options, see Erlang's `ssl` docs
     * `:parameters` - Keyword list of connection parameters
@@ -45,6 +44,9 @@ defmodule Ecto.Adapters.Postgres do
     * `:prepare` - How to prepare queries, either `:named` to use named queries
       or `:unnamed` to force unnamed queries (default: `:named`)
     * `:socket_options` - Specifies socket configuration
+    * `:show_sensitive_data_on_connection_error` - show connection data and
+      configuration whenever there is an error attempting to connect to the
+      database
 
   The `:socket_options` are particularly useful when configuring the size
   of both send and receive buffers. For example, when Ecto starts with a
@@ -61,6 +63,7 @@ defmodule Ecto.Adapters.Postgres do
   ### Storage options
 
     * `:encoding` - the database encoding (default: "UTF8")
+      or `:unspecified` to remove encoding parameter (alternative engine compatibility)
     * `:template` - the template to create the database from
     * `:lc_collate` - the collation order
     * `:lc_ctype` - the character classification
@@ -113,8 +116,8 @@ defmodule Ecto.Adapters.Postgres do
 
   # Support arrays in place of IN
   @impl true
-  def dumpers({:embed, _} = type, _),  do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
-  def dumpers({:map, _} = type, _),    do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
+  def dumpers({:embed, _}, type),      do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
+  def dumpers({:map, _}, type),        do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
   def dumpers({:in, sub}, {:in, sub}), do: [{:array, sub}]
   def dumpers(:binary_id, type),       do: [type, Ecto.UUID]
   def dumpers(_, type),                do: [type]
@@ -124,12 +127,13 @@ defmodule Ecto.Adapters.Postgres do
   @impl true
   def storage_up(opts) do
     database = Keyword.fetch!(opts, :database) || raise ":database is nil in repository configuration"
-    encoding = opts[:encoding] || "UTF8"
+    encoding = if opts[:encoding] == :unspecified, do: nil, else: opts[:encoding] || "UTF8"
     maintenance_database = Keyword.get(opts, :maintenance_database, @default_maintenance_database)
     opts = Keyword.put(opts, :database, maintenance_database)
 
     command =
-      ~s(CREATE DATABASE "#{database}" ENCODING '#{encoding}')
+      ~s(CREATE DATABASE "#{database}")
+      |> concat_if(encoding, &"ENCODING '#{&1}'")
       |> concat_if(opts[:template], &"TEMPLATE=#{&1}")
       |> concat_if(opts[:lc_ctype], &"LC_CTYPE='#{&1}'")
       |> concat_if(opts[:lc_collate], &"LC_COLLATE='#{&1}'")
@@ -161,6 +165,21 @@ defmodule Ecto.Adapters.Postgres do
         {:error, :already_down}
       {:error, error} ->
         {:error, Exception.message(error)}
+    end
+  end
+
+  @impl Ecto.Adapter.Storage
+  def storage_status(opts) do
+    database = Keyword.fetch!(opts, :database) || raise ":database is nil in repository configuration"
+    maintenance_database = Keyword.get(opts, :maintenance_database, @default_maintenance_database)
+    opts = Keyword.put(opts, :database, maintenance_database)
+
+    check_database_query = "SELECT datname FROM pg_catalog.pg_database WHERE datname = '#{database}'"
+
+    case run_query(check_database_query, opts) do
+      {:ok, %{num_rows: 0}} -> :down
+      {:ok, %{num_rows: _num_rows}} -> :up
+      other -> {:error, other}
     end
   end
 
@@ -228,6 +247,7 @@ defmodule Ecto.Adapters.Postgres do
   ## Helpers
 
   defp run_query(sql, opts) do
+    {:ok, _} = Application.ensure_all_started(:ecto_sql)
     {:ok, _} = Application.ensure_all_started(:postgrex)
 
     opts =
@@ -236,9 +256,7 @@ defmodule Ecto.Adapters.Postgres do
       |> Keyword.put(:backoff_type, :stop)
       |> Keyword.put(:max_restarts, 0)
 
-    {:ok, pid} = Task.Supervisor.start_link
-
-    task = Task.Supervisor.async_nolink(pid, fn ->
+    task = Task.Supervisor.async_nolink(Ecto.Adapters.SQL.StorageSupervisor, fn ->
       {:ok, conn} = Postgrex.start_link(opts)
 
       value = Postgrex.query(conn, sql, [], opts)

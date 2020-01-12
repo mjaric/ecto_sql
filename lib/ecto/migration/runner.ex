@@ -1,7 +1,6 @@
 defmodule Ecto.Migration.Runner do
-  # A GenServer responsible for running migrations
-  # in either `:forward` or `:backward` directions.
   @moduledoc false
+  use Agent, restart: :temporary
 
   require Logger
 
@@ -17,9 +16,9 @@ defmodule Ecto.Migration.Runner do
     level = Keyword.get(opts, :log, :info)
     sql = Keyword.get(opts, :log_sql, false)
     log = %{level: level, sql: sql}
-    args  = [self(), repo, direction, migrator_direction, log]
+    args  = {self(), repo, module, direction, migrator_direction, log}
 
-    {:ok, runner} = Supervisor.start_child(Ecto.Migration.Supervisor, args)
+    {:ok, runner} = DynamicSupervisor.start_child(Ecto.MigratorSupervisor, {__MODULE__, args})
     metadata(runner, opts)
 
     log(level, "== Running #{version} #{inspect module}.#{operation}/0 #{direction}")
@@ -40,11 +39,21 @@ defmodule Ecto.Migration.Runner do
   @doc """
   Starts the runner for the specified repo.
   """
-  def start_link(parent, repo, direction, migrator_direction, log) do
+  def start_link({parent, repo, module, direction, migrator_direction, log}) do
     Agent.start_link(fn ->
       Process.link(parent)
-      %{direction: direction, repo: repo, migrator_direction: migrator_direction,
-        command: nil, subcommands: [], log: log, commands: [], config: repo.config()}
+
+      %{
+        direction: direction,
+        repo: repo,
+        migration: module,
+        migrator_direction: migrator_direction,
+        command: nil,
+        subcommands: [],
+        log: log,
+        commands: [],
+        config: repo.config()
+      }
     end)
   end
 
@@ -99,15 +108,13 @@ defmodule Ecto.Migration.Runner do
   on a change/0 function and resets commands queue.
   """
   def flush do
-    %{commands: commands, direction: direction} = Agent.get_and_update(runner(), fn (state) ->
-      {state, %{state | commands: []}}
-    end)
+    %{commands: commands, direction: direction, repo: repo, log: log, migration: migration} =
+      Agent.get_and_update(runner(), fn state -> {state, %{state | commands: []}} end)
 
-    commands  = if direction == :backward, do: commands, else: Enum.reverse(commands)
+    commands = if direction == :backward, do: commands, else: Enum.reverse(commands)
 
     for command <- commands do
-      {repo, direction, log} = runner_config()
-      execute_in_direction(repo, direction, log, command)
+      execute_in_direction(repo, migration, direction, log, command)
     end
   end
 
@@ -187,21 +194,21 @@ defmodule Ecto.Migration.Runner do
 
   ## Execute
 
-  defp execute_in_direction(repo, :forward, log, %Command{up: up}) do
-    log_and_execute_ddl(repo, log, up)
+  defp execute_in_direction(repo, migration, :forward, log, %Command{up: up}) do
+    log_and_execute_ddl(repo, migration, log, up)
   end
 
-  defp execute_in_direction(repo, :forward, log, command) do
-    log_and_execute_ddl(repo, log, command)
+  defp execute_in_direction(repo, migration, :forward, log, command) do
+    log_and_execute_ddl(repo, migration, log, command)
   end
 
-  defp execute_in_direction(repo, :backward, log, %Command{down: down}) do
-    log_and_execute_ddl(repo, log, down)
+  defp execute_in_direction(repo, migration, :backward, log, %Command{down: down}) do
+    log_and_execute_ddl(repo, migration, log, down)
   end
 
-  defp execute_in_direction(repo, :backward, log, command) do
+  defp execute_in_direction(repo, migration, :backward, log, command) do
     if reversed = reverse(command) do
-      log_and_execute_ddl(repo, log, reversed)
+      log_and_execute_ddl(repo, migration, log, reversed)
     else
       raise Ecto.MigrationError, message:
         "cannot reverse migration command: #{command command}. " <>
@@ -289,15 +296,50 @@ defmodule Ecto.Migration.Runner do
     end
   end
 
-  defp runner_config do
-    Agent.get(runner(), fn %{repo: repo, direction: direction, log: log} ->
-      {repo, direction, log}
-    end)
+  defp log_and_execute_ddl(repo, migration, log, {instruction, %Index{} = index}) do
+    if index.concurrently do
+      migration_config = migration.__migration__()
+
+      if not migration_config[:disable_ddl_transaction] do
+        IO.warn """
+        Migration #{inspect(migration)} has set index `#{index.name}` on table \
+        `#{index.table}` to concurrently but did not disable ddl transaction. \
+        Please set:
+
+            use Ecto.Migration
+            @disable_ddl_transaction true
+
+        """, []
+      end
+
+      if not migration_config[:disable_migration_lock] do
+        IO.warn """
+        Migration #{inspect(migration)} has set index `#{index.name}` on table \
+        `#{index.table}` to concurrently but did not disable migration lock. \
+        Please set:
+
+            use Ecto.Migration
+            @disable_migration_lock true
+
+        """, []
+      end
+    end
+
+    log_and_execute_ddl(repo, log, {instruction, index})
+  end
+
+  defp log_and_execute_ddl(repo, _migration, log, command) do
+    log_and_execute_ddl(repo, log, command)
+  end
+
+  defp log_and_execute_ddl(_repo, _log, func) when is_function(func, 0) do
+    func.()
+    :ok
   end
 
   defp log_and_execute_ddl(repo, %{level: level, sql: sql}, command) do
     log(level, command(command))
-    meta = Ecto.Adapter.lookup_meta(repo)
+    meta = Ecto.Adapter.lookup_meta(repo.get_dynamic_repo())
     {:ok, logs} = repo.__adapter__.execute_ddl(meta, command, timeout: :infinity, log: sql)
 
     Enum.each(logs, fn {level, message, metadata} ->

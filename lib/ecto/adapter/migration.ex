@@ -26,9 +26,11 @@ defmodule Ecto.Adapter.Migration do
   @typedoc "All commands allowed within the block passed to `table/2`"
   @type table_subcommand ::
           {:add, field :: atom, type :: Ecto.Type.t() | Reference.t(), Keyword.t()}
+          | {:add_if_not_exists, field :: atom, type :: Ecto.Type.t() | Reference.t(), Keyword.t()}
           | {:modify, field :: atom, type :: Ecto.Type.t() | Reference.t(), Keyword.t()}
           | {:remove, field :: atom, type :: Ecto.Type.t() | Reference.t(), Keyword.t()}
           | {:remove, field :: atom}
+          | {:remove_if_exists, type :: Ecto.Type.t() | Reference.t()}
 
   @typedoc """
   A struct that represents a table or index in a database schema.
@@ -45,12 +47,6 @@ defmodule Ecto.Adapter.Migration do
 
   @doc """
   Executes migration commands.
-
-  ## Options
-
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-
   """
   @callback execute_ddl(adapter_meta, command, options :: Keyword.t()) ::
               {:ok, [{Logger.level, Logger.message, Logger.metadata}]}

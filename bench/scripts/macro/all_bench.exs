@@ -28,11 +28,11 @@ users =
 
 # We need to insert data to fetch
 Ecto.Bench.PgRepo.insert_all(User, users)
-Ecto.Bench.MySQLRepo.insert_all(User, users)
+Ecto.Bench.MyXQLRepo.insert_all(User, users)
 
 jobs = %{
   "Pg Repo.all/2" => fn -> Ecto.Bench.PgRepo.all(User, limit: limit) end,
-  "MySQL Repo.all/2" => fn -> Ecto.Bench.MySQLRepo.all(User, limit: limit) end
+  "MyXQL Repo.all/2" => fn -> Ecto.Bench.MyXQLRepo.all(User, limit: limit) end
 }
 
 path = System.get_env("BENCHMARKS_OUTPUT_PATH") || "bench/results"
@@ -42,9 +42,12 @@ Benchee.run(
   jobs,
   formatters: [Benchee.Formatters.JSON, Benchee.Formatters.Console],
   formatter_options: [json: [file: file]],
-  time: 10
+  time: 10,
+  after_each: fn results ->
+    ^limit = length(results)
+  end
 )
 
 # Clean inserted data
 Ecto.Bench.PgRepo.delete_all(User)
-Ecto.Bench.MySQLRepo.delete_all(User)
+Ecto.Bench.MyXQLRepo.delete_all(User)

@@ -18,7 +18,10 @@ defmodule Ecto.MigrationTest do
 
   setup meta do
     direction = meta[:direction] || :forward
-    {:ok, runner} = Runner.start_link(self(), TestRepo, direction, :up, %{level: false, sql: false})
+
+    {:ok, runner} =
+      Runner.start_link({self(), TestRepo, __MODULE__, direction, :up, %{level: false, sql: false}})
+
     Runner.metadata(runner, meta)
     {:ok, runner: runner}
   end
@@ -172,6 +175,15 @@ defmodule Ecto.MigrationTest do
            {:create, table, [{:add, :uuid, :uuid, [primary_key: true]}]}
   end
 
+  @tag repo_config: [migration_primary_key: [name: :uuid, type: :uuid]]
+  test "forward: create a table with only custom primary key" do
+    create(table = table(:posts))
+    flush()
+
+    assert last_command() ==
+           {:create, table, [{:add, :uuid, :uuid, [primary_key: true]}]}
+  end
+
   @tag repo_config: [migration_primary_key: [type: :uuid, default: {:fragment, "gen_random_uuid()"}]]
   test "forward: create a table with custom primary key options" do
     create(table = table(:posts)) do
@@ -253,18 +265,23 @@ defmodule Ecto.MigrationTest do
   test "forward: alters a table" do
     alter table(:posts) do
       add :summary, :text
+      add_if_not_exists :summary, :text
       modify :title, :text
       remove :views
       remove :status, :string
+      remove_if_exists :status, :string
     end
     flush()
 
     assert last_command() ==
            {:alter, %Table{name: "posts"},
               [{:add, :summary, :text, []},
+               {:add_if_not_exists, :summary, :text, []},
                {:modify, :title, :text, []},
                {:remove, :views},
-               {:remove, :status, :string, []}]}
+               {:remove, :status, :string, []},
+               {:remove_if_exists, :status, :string}]
+              }
   end
 
   test "forward: removing a reference column (remove/3 called)" do
@@ -275,10 +292,27 @@ defmodule Ecto.MigrationTest do
     assert {:alter, %Table{name: "posts"}, [{:remove, :author_id, %Reference{table: "authors"}, []}]} = last_command()
   end
 
+  test "forward: removing a reference if column (remove_if_exists/2 called)" do
+    alter table(:posts) do
+      remove_if_exists :author_id, references(:authors)
+    end
+    flush()
+    assert {:alter, %Table{name: "posts"}, [{:remove_if_exists, :author_id, %Reference{table: "authors"}}]} = last_command()
+  end
+
   test "forward: alter numeric column without specifying precision" do
     assert_raise ArgumentError, "column cost is missing precision option", fn ->
       alter table(:posts) do
         modify :cost, :decimal, scale: 5
+      end
+      flush()
+    end
+  end
+
+  test "forward: conditional creates a numeric column without specifying precision" do
+    assert_raise ArgumentError, "column cost is missing precision option", fn ->
+      alter table(:posts) do
+        add_if_not_exists :cost, :decimal, scale: 5
       end
       flush()
     end

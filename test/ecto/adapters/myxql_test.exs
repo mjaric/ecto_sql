@@ -1,10 +1,10 @@
-defmodule Ecto.Adapters.MySQLTest do
+defmodule Ecto.Adapters.MyXQLTest do
   use ExUnit.Case, async: true
 
   import Ecto.Query
 
   alias Ecto.Queryable
-  alias Ecto.Adapters.MySQL.Connection, as: SQL
+  alias Ecto.Adapters.MyXQL.Connection, as: SQL
   alias Ecto.Migration.Reference
 
   defmodule Schema do
@@ -15,10 +15,10 @@ defmodule Ecto.Adapters.MySQLTest do
       field :y, :integer
       field :z, :integer
 
-      has_many :comments, Ecto.Adapters.MySQLTest.Schema2,
+      has_many :comments, Ecto.Adapters.MyXQLTest.Schema2,
         references: :x,
         foreign_key: :z
-      has_one :permalink, Ecto.Adapters.MySQLTest.Schema3,
+      has_one :permalink, Ecto.Adapters.MyXQLTest.Schema3,
         references: :y,
         foreign_key: :id
     end
@@ -28,7 +28,7 @@ defmodule Ecto.Adapters.MySQLTest do
     use Ecto.Schema
 
     schema "schema2" do
-      belongs_to :post, Ecto.Adapters.MySQLTest.Schema,
+      belongs_to :post, Ecto.Adapters.MyXQLTest.Schema,
         references: :x,
         foreign_key: :z
     end
@@ -43,7 +43,7 @@ defmodule Ecto.Adapters.MySQLTest do
   end
 
   defp plan(query, operation \\ :all) do
-    {query, _params} = Ecto.Adapter.Queryable.plan_query(operation, Ecto.Adapters.MySQL, query)
+    {query, _params} = Ecto.Adapter.Queryable.plan_query(operation, Ecto.Adapters.MyXQL, query)
     query
   end
 
@@ -78,11 +78,18 @@ defmodule Ecto.Adapters.MySQLTest do
     query = "posts" |> select([r], r.x) |> plan()
     assert all(query) == ~s{SELECT p0.`x` FROM `posts` AS p0}
 
+    query = "posts" |> select([r], fragment("?", r)) |> plan()
+    assert all(query) == ~s{SELECT p0 FROM `posts` AS p0}
+
     query = "Posts" |> select([:x]) |> plan()
     assert all(query) == ~s{SELECT P0.`x` FROM `Posts` AS P0}
 
     query = "0posts" |> select([:x]) |> plan()
     assert all(query) == ~s{SELECT t0.`x` FROM `0posts` AS t0}
+
+    assert_raise Ecto.QueryError, ~r"MySQL does not support selecting all fields from `posts` without a schema", fn ->
+      all from(p in "posts", select: p) |> plan()
+    end
   end
 
   test "from with subquery" do
@@ -91,6 +98,132 @@ defmodule Ecto.Adapters.MySQLTest do
 
     query = subquery("posts" |> select([r], %{x: r.x, z: r.y})) |> select([r], r) |> plan()
     assert all(query) == ~s{SELECT s0.`x`, s0.`z` FROM (SELECT p0.`x` AS `x`, p0.`y` AS `z` FROM `posts` AS p0) AS s0}
+  end
+
+  test "CTE" do
+    initial_query =
+      "categories"
+      |> where([c], is_nil(c.parent_id))
+      |> select([c], %{id: c.id, depth: fragment("1")})
+
+    iteration_query =
+      "categories"
+      |> join(:inner, [c], t in "tree", on: t.id == c.parent_id)
+      |> select([c, t], %{id: c.id, depth: fragment("? + 1", t.depth)})
+
+    cte_query = initial_query |> union_all(^iteration_query)
+
+    query =
+      Schema
+      |> recursive_ctes(true)
+      |> with_cte("tree", as: ^cte_query)
+      |> join(:inner, [r], t in "tree", on: t.id == r.category_id)
+      |> select([r, t], %{x: r.x, category_id: t.id, depth: type(t.depth, :integer)})
+      |> plan()
+
+    assert all(query) ==
+      ~s{WITH RECURSIVE `tree` AS } <>
+      ~s{(SELECT c0.`id` AS `id`, 1 AS `depth` FROM `categories` AS c0 WHERE (c0.`parent_id` IS NULL) } <>
+      ~s{UNION ALL } <>
+      ~s{(SELECT c0.`id`, t1.`depth` + 1 FROM `categories` AS c0 } <>
+      ~s{INNER JOIN `tree` AS t1 ON t1.`id` = c0.`parent_id`)) } <>
+      ~s{SELECT s0.`x`, t1.`id`, CAST(t1.`depth` AS unsigned) } <>
+      ~s{FROM `schema` AS s0 } <>
+      ~s{INNER JOIN `tree` AS t1 ON t1.`id` = s0.`category_id`}
+  end
+
+  @raw_sql_cte """
+  SELECT * FROM categories WHERE c.parent_id IS NULL
+  UNION ALL
+  SELECT * FROM categories AS c, category_tree AS ct WHERE ct.id = c.parent_id
+  """
+
+  test "reference CTE in union" do
+    comments_scope_query =
+      "comments"
+      |> where([c], is_nil(c.deleted_at))
+      |> select([c], %{entity_id: c.entity_id, text: c.text})
+
+    posts_query =
+      "posts"
+      |> join(:inner, [p], c in "comments_scope", on: c.entity_id == p.guid)
+      |> select([p, c], [p.title, c.text])
+
+    videos_query =
+      "videos"
+      |> join(:inner, [v], c in "comments_scope", on: c.entity_id == v.guid)
+      |> select([v, c], [v.title, c.text])
+
+    query =
+      posts_query
+      |> union_all(^videos_query)
+      |> with_cte("comments_scope", as: ^comments_scope_query)
+      |> plan()
+
+    assert all(query) ==
+      ~s{WITH `comments_scope` AS (} <>
+      ~s{SELECT c0.`entity_id` AS `entity_id`, c0.`text` AS `text` } <>
+      ~s{FROM `comments` AS c0 WHERE (c0.`deleted_at` IS NULL)) } <>
+      ~s{SELECT p0.`title`, c1.`text` } <>
+      ~s{FROM `posts` AS p0 } <>
+      ~s{INNER JOIN `comments_scope` AS c1 ON c1.`entity_id` = p0.`guid` } <>
+      ~s{UNION ALL } <>
+      ~s{(SELECT v0.`title`, c1.`text` } <>
+      ~s{FROM `videos` AS v0 } <>
+      ~s{INNER JOIN `comments_scope` AS c1 ON c1.`entity_id` = v0.`guid`)}
+  end
+
+  test "fragment CTE" do
+    query =
+      Schema
+      |> recursive_ctes(true)
+      |> with_cte("tree", as: fragment(@raw_sql_cte))
+      |> join(:inner, [p], c in "tree", on: c.id == p.category_id)
+      |> select([r], r.x)
+      |> plan()
+
+    assert all(query) ==
+      ~s{WITH RECURSIVE `tree` AS (#{@raw_sql_cte}) } <>
+      ~s{SELECT s0.`x` } <>
+      ~s{FROM `schema` AS s0 } <>
+      ~s{INNER JOIN `tree` AS t1 ON t1.`id` = s0.`category_id`}
+  end
+
+  test "CTE update_all" do
+    cte_query =
+      from(x in Schema, order_by: [asc: :id], limit: 10, lock: "FOR UPDATE SKIP LOCKED", select: %{id: x.id})
+
+    query =
+      Schema
+      |> with_cte("target_rows", as: ^cte_query)
+      |> join(:inner, [row], target in "target_rows", on: target.id == row.id)
+      |> update(set: [x: 123])
+      |> plan(:update_all)
+
+    assert update_all(query) ==
+      ~s{WITH `target_rows` AS } <>
+      ~s{(SELECT s0.`id` AS `id` FROM `schema` AS s0 ORDER BY s0.`id` LIMIT 10 FOR UPDATE SKIP LOCKED) } <>
+      ~s{UPDATE `schema` AS s0, `target_rows` AS t1 } <>
+      ~s{SET s0.`x` = 123 } <>
+      ~s{WHERE (t1.`id` = s0.`id`)}
+  end
+
+  test "CTE delete_all" do
+    cte_query =
+      from(x in Schema, order_by: [asc: :id], limit: 10, lock: "FOR UPDATE SKIP LOCKED", select: %{id: x.id})
+
+    query =
+      Schema
+      |> with_cte("target_rows", as: ^cte_query)
+      |> join(:inner, [row], target in "target_rows", on: target.id == row.id)
+      |> plan(:delete_all)
+
+    assert delete_all(query) ==
+      ~s{WITH `target_rows` AS } <>
+      ~s{(SELECT s0.`id` AS `id` FROM `schema` AS s0 ORDER BY s0.`id` LIMIT 10 FOR UPDATE SKIP LOCKED) } <>
+      ~s{DELETE s0.* } <>
+      ~s{FROM `schema` AS s0 } <>
+      ~s{INNER JOIN `target_rows` AS t1 ON t1.`id` = s0.`id`}
   end
 
   test "select" do
@@ -413,10 +546,13 @@ defmodule Ecto.Adapters.MySQLTest do
   end
 
   test "interpolated values" do
-    union = "schema1" |> select([m], {m.id, ^true}) |> where([], fragment("?", ^3))
-    union_all = "schema2" |> select([m], {m.id, ^false}) |> where([], fragment("?", ^4))
+    cte1 = "schema1" |> select([m], %{id: m.id, smth: ^true}) |> where([], fragment("?", ^1))
+    union = "schema1" |> select([m], {m.id, ^true}) |> where([], fragment("?", ^5))
+    union_all = "schema2" |> select([m], {m.id, ^false}) |> where([], fragment("?", ^6))
 
     query = Schema
+            |> with_cte("cte1", as: ^cte1)
+            |> with_cte("cte2", as: fragment("SELECT * FROM schema WHERE ?", ^2))
             |> select([m], {m.id, ^0})
             |> join(:inner, [], Schema2, on: fragment("?", ^true))
             |> join(:inner, [], Schema2, on: fragment("?", ^false))
@@ -424,16 +560,18 @@ defmodule Ecto.Adapters.MySQLTest do
             |> where([], fragment("?", ^false))
             |> having([], fragment("?", ^true))
             |> having([], fragment("?", ^false))
-            |> group_by([], fragment("?", ^1))
-            |> group_by([], fragment("?", ^2))
+            |> group_by([], fragment("?", ^3))
+            |> group_by([], fragment("?", ^4))
             |> union(^union)
             |> union_all(^union_all)
-            |> order_by([], fragment("?", ^5))
-            |> limit([], ^6)
-            |> offset([], ^7)
+            |> order_by([], fragment("?", ^7))
+            |> limit([], ^8)
+            |> offset([], ^9)
             |> plan()
 
     result =
+      "WITH `cte1` AS (SELECT s0.`id` AS `id`, ? AS `smth` FROM `schema1` AS s0 WHERE (?)), " <>
+      "`cte2` AS (SELECT * FROM schema WHERE ?) " <>
       "SELECT s0.`id`, ? FROM `schema` AS s0 INNER JOIN `schema2` AS s1 ON ? " <>
       "INNER JOIN `schema2` AS s2 ON ? WHERE (?) AND (?) " <>
       "GROUP BY ?, ? HAVING (?) AND (?) " <>
@@ -905,31 +1043,16 @@ defmodule Ecto.Adapters.MySQLTest do
     """ |> remove_newlines]
   end
 
-  test "create table with a map column, and an empty map default" do
-    create = {:create, table(:posts),
-              [
-                {:add, :a, :map, [default: %{}]}
-              ]
-            }
-    assert execute_ddl(create) == [~s|CREATE TABLE `posts` (`a` text DEFAULT '{}') ENGINE = INNODB|]
-  end
-
   test "create table with a map column, and a map default with values" do
     create = {:create, table(:posts),
               [
                 {:add, :a, :map, [default: %{foo: "bar", baz: "boom"}]}
               ]
             }
-    assert execute_ddl(create) == [~s|CREATE TABLE `posts` (`a` text DEFAULT '{"baz":"boom","foo":"bar"}') ENGINE = INNODB|]
-  end
 
-  test "create table with a map column, and a string default" do
-    create = {:create, table(:posts),
-              [
-                {:add, :a, :map, [default: ~s|{"foo":"bar","baz":"boom"}|]}
-              ]
-            }
-    assert execute_ddl(create) == [~s|CREATE TABLE `posts` (`a` text DEFAULT '{"foo":"bar","baz":"boom"}') ENGINE = INNODB|]
+    assert_raise ArgumentError, ~r/:default is not supported for json columns by MySQL/, fn ->
+      execute_ddl(create)
+    end
   end
 
   test "create table with time columns" do
@@ -1036,6 +1159,8 @@ defmodule Ecto.Adapters.MySQLTest do
     alter = {:alter, table(:posts),
                [{:add, :title, :string, [default: "Untitled", size: 100, null: false]},
                 {:add, :author_id, %Reference{table: :author}, []},
+                {:add_if_not_exists, :subtitle, :string, [size: 100, null: false]},
+                {:add_if_not_exists, :editor_id, %Reference{table: :editor}, []},
                 {:modify, :price, :numeric, [precision: 8, scale: 2, null: true]},
                 {:modify, :cost, :integer, [null: false, default: nil]},
                 {:modify, :permalink_id, %Reference{table: :permalinks}, null: false},
@@ -1044,12 +1169,17 @@ defmodule Ecto.Adapters.MySQLTest do
                 {:modify, :group_id, %Reference{table: :groups, column: :gid}, from: %Reference{table: :groups}},
                 {:remove, :summary},
                 {:remove, :body, :text, []},
-                {:remove, :space_id, %Reference{table: :author}, []}]}
+                {:remove, :space_id, %Reference{table: :author}, []},
+                {:remove_if_exists, :body, :text},
+                {:remove_if_exists, :space_id, %Reference{table: :author}}]}
 
     assert execute_ddl(alter) == ["""
     ALTER TABLE `posts` ADD `title` varchar(100) DEFAULT 'Untitled' NOT NULL,
     ADD `author_id` BIGINT UNSIGNED,
     ADD CONSTRAINT `posts_author_id_fkey` FOREIGN KEY (`author_id`) REFERENCES `author`(`id`),
+    ADD IF NOT EXISTS `subtitle` varchar(100) NOT NULL,
+    ADD IF NOT EXISTS `editor_id` BIGINT UNSIGNED,
+    ADD CONSTRAINT `posts_editor_id_fkey` FOREIGN KEY IF NOT EXISTS (`editor_id`) REFERENCES `editor`(`id`),
     MODIFY `price` numeric(8,2) NULL, MODIFY `cost` integer DEFAULT NULL NOT NULL,
     MODIFY `permalink_id` BIGINT UNSIGNED NOT NULL,
     ADD CONSTRAINT `posts_permalink_id_fkey` FOREIGN KEY (`permalink_id`) REFERENCES `permalinks`(`id`),
@@ -1062,7 +1192,10 @@ defmodule Ecto.Adapters.MySQLTest do
     DROP `summary`,
     DROP `body`,
     DROP FOREIGN KEY `posts_space_id_fkey`,
-    DROP `space_id`
+    DROP `space_id`,
+    DROP IF EXISTS `body`,
+    DROP FOREIGN KEY IF EXISTS `posts_space_id_fkey`,
+    DROP IF EXISTS `space_id`
     """ |> remove_newlines]
   end
 
@@ -1106,12 +1239,6 @@ defmodule Ecto.Adapters.MySQLTest do
            [~s|CREATE INDEX `posts_category_id_permalink_index` ON `foo`.`posts` (`category_id`, `permalink`)|]
   end
 
-  test "create index asserting concurrency" do
-    create = {:create, index(:posts, ["permalink(8)"], name: "posts$main", concurrently: true)}
-    assert execute_ddl(create) ==
-           [~s|CREATE INDEX `posts$main` ON `posts` (permalink(8)) LOCK=NONE|]
-  end
-
   test "create unique index" do
     create = {:create, index(:posts, [:permalink], unique: true)}
     assert execute_ddl(create) ==
@@ -1151,11 +1278,6 @@ defmodule Ecto.Adapters.MySQLTest do
   test "drop index with prefix" do
     drop = {:drop, index(:posts, [:id], name: "posts$main", prefix: :foo)}
     assert execute_ddl(drop) == [~s|DROP INDEX `posts$main` ON `foo`.`posts`|]
-  end
-
-  test "drop index asserting concurrency" do
-    drop = {:drop, index(:posts, [:id], name: "posts$main", concurrently: true)}
-    assert execute_ddl(drop) == [~s|DROP INDEX `posts$main` ON `posts` LOCK=NONE|]
   end
 
   test "rename table" do

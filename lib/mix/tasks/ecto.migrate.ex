@@ -21,7 +21,8 @@ defmodule Mix.Tasks.Ecto.Migrate do
     strict_version_order: :boolean,
     repo: [:keep, :string],
     no_compile: :boolean,
-    no_deps_check: :boolean
+    no_deps_check: :boolean,
+    migrations_path: :string
   ]
 
   @moduledoc """
@@ -63,7 +64,6 @@ defmodule Mix.Tasks.Ecto.Migrate do
       mix ecto.migrate -n 3
       mix ecto.migrate --step 3
 
-      mix ecto.migrate -v 20080906120000
       mix ecto.migrate --to 20080906120000
 
   ## Command line options
@@ -74,11 +74,12 @@ defmodule Mix.Tasks.Ecto.Migrate do
     * `--to` - run all migrations up to and including version
     * `--quiet` - do not log migration commands
     * `--prefix` - the prefix to run migrations on
-    * `--pool-size` - the pool size if the repository is started only for the task (defaults to 1)
+    * `--pool-size` - the pool size if the repository is started only for the task (defaults to 2)
     * `--log-sql` - log the raw sql migrations are running
     * `--strict-version-order` - abort when applying a migration with old timestamp
     * `--no-compile` - does not compile applications before migrating
     * `--no-deps-check` - does not check depedendencies before migrating
+    * `--migrations-path` - the path to run the migrations from
 
   """
 
@@ -97,21 +98,28 @@ defmodule Mix.Tasks.Ecto.Migrate do
         do: Keyword.merge(opts, [log: false, log_sql: false]),
         else: opts
 
-    Enum.each repos, fn repo ->
-      ensure_repo(repo, args)
-      path = ensure_migrations_path(repo)
-      {:ok, pid, apps} = ensure_started(repo, opts)
+    # Start ecto_sql explicitly before as we don't need
+    # to restart those apps if migrated.
+    {:ok, _} = Application.ensure_all_started(:ecto_sql)
 
+    for repo <- repos do
+      ensure_repo(repo, args)
+      path = ensure_migrations_path(repo, opts)
       pool = repo.config[:pool]
-      migrated =
-        if function_exported?(pool, :unboxed_run, 2) do
-          pool.unboxed_run(repo, fn -> migrator.(repo, path, :up, opts) end)
+
+      fun =
+        if Code.ensure_loaded?(pool) and function_exported?(pool, :unboxed_run, 2) do
+          &pool.unboxed_run(&1, fn -> migrator.(&1, path, :up, opts) end)
         else
-          migrator.(repo, path, :up, opts)
+          &migrator.(&1, path, :up, opts)
         end
 
-      pid && repo.stop()
-      restart_apps_if_migrated(apps, migrated)
+      case Ecto.Migrator.with_repo(repo, fun, [mode: :temporary] ++ opts) do
+        {:ok, _migrated, _apps} -> :ok
+        {:error, error} -> Mix.raise "Could not start repo #{inspect repo}, error: #{inspect error}"
+      end
     end
+
+    :ok
   end
 end

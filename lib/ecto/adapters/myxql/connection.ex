@@ -1,6 +1,5 @@
-if Code.ensure_loaded?(Mariaex) do
-
-  defmodule Ecto.Adapters.MySQL.Connection do
+if Code.ensure_loaded?(MyXQL) do
+  defmodule Ecto.Adapters.MyXQL.Connection do
     @moduledoc false
     @behaviour Ecto.Adapters.SQL.Connection
 
@@ -8,26 +7,25 @@ if Code.ensure_loaded?(Mariaex) do
 
     @impl true
     def child_spec(opts) do
-      opts
-      |> Keyword.put_new(:datetime, :structs)
-      |> Mariaex.child_spec()
+      MyXQL.child_spec(opts)
     end
 
     ## Query
 
     @impl true
     def prepare_execute(conn, name, sql, params, opts) do
-      Mariaex.prepare_execute(conn, name, sql, map_params(params), opts)
+      MyXQL.prepare_execute(conn, name, sql, params, opts)
     end
 
     @impl true
     def query(conn, sql, params, opts) do
-      Mariaex.query(conn, sql, map_params(params), opts)
+      opts = Keyword.put_new(opts, :query_type, :binary_then_text)
+      MyXQL.query(conn, sql, params, opts)
     end
 
     @impl true
     def execute(conn, %{ref: ref} = query, params, opts) do
-      case Mariaex.execute(conn, query, map_params(params), opts) do
+      case MyXQL.execute(conn, query, params, opts) do
         {:ok, %{ref: ^ref}, result} ->
           {:ok, result}
 
@@ -41,29 +39,18 @@ if Code.ensure_loaded?(Mariaex) do
 
     @impl true
     def stream(conn, sql, params, opts) do
-      Mariaex.stream(conn, sql, params, opts)
-    end
-
-    defp map_params(params) do
-      Enum.map params, fn
-        %{__struct__: _} = value ->
-          value
-        %{} = value ->
-          json_encode!(value)
-        value ->
-          value
-      end
+      MyXQL.stream(conn, sql, params, opts)
     end
 
     @impl true
-    def to_constraints(%Mariaex.Error{mariadb: %{code: 1062, message: message}}) do
+    def to_constraints(%MyXQL.Error{mysql: %{name: :ER_DUP_ENTRY}, message: message}) do
       case :binary.split(message, " for key ") do
         [_, quoted] -> [unique: strip_quotes(quoted)]
         _ -> []
       end
     end
-    def to_constraints(%Mariaex.Error{mariadb: %{code: code, message: message}})
-        when code in [1451, 1452] do
+    def to_constraints(%MyXQL.Error{mysql: %{name: name}, message: message})
+        when name in [:ER_ROW_IS_REFERENCED_2, :ER_NO_REFERENCED_ROW_2] do
       case :binary.split(message, [" CONSTRAINT ", " FOREIGN KEY "], [:global]) do
         [_, quoted, _] -> [foreign_key: strip_quotes(quoted)]
         _ -> []
@@ -80,12 +67,13 @@ if Code.ensure_loaded?(Mariaex) do
 
     ## Query
 
-    alias Ecto.Query.{BooleanExpr, JoinExpr, QueryExpr}
+    alias Ecto.Query.{BooleanExpr, JoinExpr, QueryExpr, WithExpr}
 
     @impl true
     def all(query) do
       sources = create_names(query)
 
+      cte = cte(query, sources)
       from = from(query, sources)
       select = select(query, sources)
       join = join(query, sources)
@@ -99,7 +87,7 @@ if Code.ensure_loaded?(Mariaex) do
       offset = offset(query, sources)
       lock = lock(query.lock)
 
-      [select, from, join, where, group_by, having, window, combinations, order_by, limit, offset | lock]
+      [cte, select, from, join, where, group_by, having, window, combinations, order_by, limit, offset | lock]
     end
 
     @impl true
@@ -111,6 +99,7 @@ if Code.ensure_loaded?(Mariaex) do
       end
 
       sources = create_names(query)
+      cte = cte(query, sources)
       {from, name} = get_source(query, sources, 0, source)
 
       fields = if prefix do
@@ -123,7 +112,7 @@ if Code.ensure_loaded?(Mariaex) do
       prefix = prefix || ["UPDATE ", from, " AS ", name, join, " SET "]
       where  = where(%{query | wheres: wheres ++ query.wheres}, sources)
 
-      [prefix, fields | where]
+      [cte, prefix, fields | where]
     end
 
     @impl true
@@ -133,13 +122,14 @@ if Code.ensure_loaded?(Mariaex) do
       end
 
       sources = create_names(query)
+      cte = cte(query, sources)
       {_, name, _} = elem(sources, 0)
 
       from   = from(query, sources)
       join   = join(query, sources)
       where  = where(query, sources)
 
-      ["DELETE ", name, ".*", from, join | where]
+      [cte, "DELETE ", name, ".*", from, join | where]
     end
 
     @impl true
@@ -226,8 +216,7 @@ if Code.ensure_loaded?(Mariaex) do
 
     defp handle_call(fun, _arity), do: {:fun, Atom.to_string(fun)}
 
-    defp select(%{select: %{fields: fields}, distinct: distinct} = query,
-                sources) do
+    defp select(%{select: %{fields: fields}, distinct: distinct} = query, sources) do
       ["SELECT ", distinct(distinct, sources, query) | select(fields, sources, query)]
     end
 
@@ -242,6 +231,14 @@ if Code.ensure_loaded?(Mariaex) do
       do: "TRUE"
     defp select(fields, sources, query) do
       intersperse_map(fields, ", ", fn
+        {:&, _, [idx]} ->
+          case elem(sources, idx) do
+            {source, _, nil} ->
+              error!(query, "MySQL does not support selecting all fields from #{source} without a schema. " <>
+                            "Please specify a schema or specify exactly which fields you want to select")
+            {_, source, _} ->
+              source
+          end
         {key, value} ->
           [expr(value, sources, query), " AS ", quote_name(key)]
         value ->
@@ -253,6 +250,21 @@ if Code.ensure_loaded?(Mariaex) do
       {from, name} = get_source(query, sources, 0, source)
       [" FROM ", from, " AS ", name | Enum.map(hints, &[?\s | &1])]
     end
+
+    defp cte(%{with_ctes: %WithExpr{recursive: recursive, queries: [_ | _] = queries}} = query, sources) do
+      recursive_opt = if recursive, do: "RECURSIVE ", else: ""
+      ctes = intersperse_map(queries, ", ", &cte_expr(&1, sources, query))
+      ["WITH ", recursive_opt, ctes, " "]
+    end
+
+    defp cte(%{with_ctes: _}, _), do: []
+
+    defp cte_expr({name, cte}, sources, query) do
+      [quote_name(name), " AS ", cte_query(cte, sources, query)]
+    end
+
+    defp cte_query(%Ecto.Query{} = query, _, _), do: ["(", all(query), ")"]
+    defp cte_query(%QueryExpr{expr: expr}, sources, query), do: expr(expr, sources, query)
 
     defp update_fields(type, %{updates: updates} = query, sources) do
      fields = for(%{expr: expr} <- updates,
@@ -714,6 +726,11 @@ if Code.ensure_loaded?(Mariaex) do
     @impl true
     def ddl_logs(_), do: []
 
+    @impl true
+    def table_exists_query(table) do
+      {"SELECT true FROM information_schema.tables WHERE table_name = ? AND table_schema = DATABASE() LIMIT 1", [table]}
+    end
+
     defp pk_definitions(columns, prefix) do
       pks =
         for {_, name, _, opts} <- columns,
@@ -752,6 +769,15 @@ if Code.ensure_loaded?(Mariaex) do
       ["ADD ", quote_name(name), ?\s, column_type(type, opts), column_options(opts)]
     end
 
+    defp column_change(table, {:add_if_not_exists, name, %Reference{} = ref, opts}) do
+      ["ADD IF NOT EXISTS ", quote_name(name), ?\s, reference_column_type(ref.type, opts),
+       column_options(opts), constraint_if_not_exists_expr(ref, table, name)]
+    end
+
+    defp column_change(_table, {:add_if_not_exists, name, type, opts}) do
+      ["ADD IF NOT EXISTS ", quote_name(name), ?\s, column_type(type, opts), column_options(opts)]
+    end
+
     defp column_change(table, {:modify, name, %Reference{} = ref, opts}) do
       [drop_constraint_expr(opts[:from], table, name), "MODIFY ", quote_name(name), ?\s, reference_column_type(ref.type, opts),
        column_options(opts), constraint_expr(ref, table, name)]
@@ -766,6 +792,11 @@ if Code.ensure_loaded?(Mariaex) do
       [drop_constraint_expr(ref, table, name), "DROP ", quote_name(name)]
     end
     defp column_change(_table, {:remove, name, _type, _opts}), do: ["DROP ", quote_name(name)]
+
+    defp column_change(table, {:remove_if_exists, name, %Reference{} = ref}) do
+      [drop_constraint_if_exists_expr(ref, table, name), "DROP IF EXISTS ", quote_name(name)]
+    end
+    defp column_change(_table, {:remove_if_exists, name, _type}), do: ["DROP IF EXISTS ", quote_name(name)]
 
     defp column_options(opts) do
       default = Keyword.fetch(opts, :default)
@@ -783,12 +814,10 @@ if Code.ensure_loaded?(Mariaex) do
       do: [" DEFAULT '", escape_string(literal), ?']
     defp default_expr({:ok, literal}) when is_number(literal) or is_boolean(literal),
       do: [" DEFAULT ", to_string(literal)]
-    defp default_expr({:ok, %{} = map}) do
-      default = json_encode!(map)
-      [" DEFAULT ", [?', escape_string(default), ?']]
-    end
     defp default_expr({:ok, {:fragment, expr}}),
       do: [" DEFAULT ", expr]
+    defp default_expr({:ok, value}) when is_map(value),
+      do: error!(nil, ":default is not supported for json columns by MySQL")
     defp default_expr(:error),
       do: []
 
@@ -837,6 +866,13 @@ if Code.ensure_loaded?(Mariaex) do
            ?(, quote_name(ref.column), ?),
            reference_on_delete(ref.on_delete), reference_on_update(ref.on_update)]
 
+    defp constraint_if_not_exists_expr(%Reference{} = ref, table, name),
+      do: [", ADD CONSTRAINT ", reference_name(ref, table, name),
+           " FOREIGN KEY IF NOT EXISTS (", quote_name(name), ?),
+           " REFERENCES ", quote_table(ref.prefix || table.prefix, ref.table),
+           ?(, quote_name(ref.column), ?),
+           reference_on_delete(ref.on_delete), reference_on_update(ref.on_update)]
+
     defp reference_expr(%Reference{} = ref, table, name),
       do: [", CONSTRAINT ", reference_name(ref, table, name),
            " FOREIGN KEY (", quote_name(name), ?),
@@ -847,6 +883,11 @@ if Code.ensure_loaded?(Mariaex) do
     defp drop_constraint_expr(%Reference{} = ref, table, name),
       do: ["DROP FOREIGN KEY ", reference_name(ref, table, name), ", "]
     defp drop_constraint_expr(_, _, _),
+      do: []
+
+    defp drop_constraint_if_exists_expr(%Reference{} = ref, table, name),
+      do: ["DROP FOREIGN KEY IF EXISTS ", reference_name(ref, table, name), ", "]
+    defp drop_constraint_if_exists_expr(_, _, _),
       do: []
 
     defp reference_name(%Reference{name: nil}, table, column),
@@ -933,8 +974,8 @@ if Code.ensure_loaded?(Mariaex) do
     defp ecto_to_db(:float, _query),               do: "double"
     defp ecto_to_db(:binary, _query),              do: "blob"
     defp ecto_to_db(:uuid, _query),                do: "binary(16)" # MySQL does not support uuid
-    defp ecto_to_db(:map, _query),                 do: "text"
-    defp ecto_to_db({:map, _}, _query),            do: "text"
+    defp ecto_to_db(:map, _query),                 do: "json"
+    defp ecto_to_db({:map, _}, _query),            do: "json"
     defp ecto_to_db(:time_usec, _query),           do: "time"
     defp ecto_to_db(:utc_datetime, _query),        do: "datetime"
     defp ecto_to_db(:utc_datetime_usec, _query),   do: "datetime"
@@ -947,11 +988,6 @@ if Code.ensure_loaded?(Mariaex) do
     end
     defp error!(query, message) do
       raise Ecto.QueryError, query: query, message: message
-    end
-
-    defp json_encode!(value) do
-      library = Application.get_env(:mariaex, :json_library, Jason)
-      IO.iodata_to_binary(library.encode_to_iodata!(value))
     end
   end
 end

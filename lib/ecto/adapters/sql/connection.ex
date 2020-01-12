@@ -83,7 +83,7 @@ defmodule Ecto.Adapters.SQL.Connection do
   """
   @callback insert(prefix ::String.t, table :: String.t,
                    header :: [atom], rows :: [[atom | nil]],
-                   on_conflict :: Ecto.Adapter.on_conflict, returning :: [atom]) :: iodata
+                   on_conflict :: Ecto.Adapter.Schema.on_conflict, returning :: [atom]) :: iodata
 
   @doc """
   Returns an UPDATE for the given `fields` in `table` filtered by
@@ -109,4 +109,9 @@ defmodule Ecto.Adapters.SQL.Connection do
   Receives a query result and returns a list of logs.
   """
   @callback ddl_logs(result :: term) :: [{Logger.level, Logger.message, Logger.metadata}]
+
+  @doc """
+  Returns a queryable to check if the given `table` exists.
+  """
+  @callback table_exists_query(table :: String.t) :: {iodata, [term]}
 end

@@ -1,20 +1,20 @@
 defmodule EctoSQL.MixProject do
   use Mix.Project
 
-  @version "3.0.4"
-  @adapters ~w(pg mysql mssql)
+  @version "3.3.2"
+  @adapters ~w(pg myxql)
 
   def project do
     [
       app: :ecto_sql,
       version: @version,
-      elixir: "~> 1.4",
+      elixir: "~> 1.6",
       deps: deps(),
       test_paths: test_paths(System.get_env("ECTO_ADAPTER")),
       xref: [
         exclude: [
-          Mariaex,
-          Ecto.Adapters.MySQL.Connection,
+          MyXQL,
+          Ecto.Adapters.MyXQL.Connection,
           Postgrex,
           Ecto.Adapters.Postgres.Connection,
           Tds,
@@ -46,17 +46,17 @@ defmodule EctoSQL.MixProject do
 
   defp deps do
     [
-      {:ecto, "~> 3.0.6", ecto_opts()},
-      {:telemetry, "~> 0.3.0"},
+      ecto_dep(),
+      {:telemetry, "~> 0.4.0"},
 
       # Drivers
-      {:db_connection, "~> 2.0"},
-      {:postgrex, "~> 0.14.0", optional: true},
-      {:mariaex, "~> 0.9.1", optional: true},
+      {:db_connection, "~> 2.2"},
+      postgrex_dep(),
+      myxql_dep(),
       {:tds, "~> 2.0", optional: true},
 
       # Bring something in for JSON during tests
-      {:jason, ">= 0.0.0", only: :test},
+      {:jason, ">= 0.0.0", only: [:test, :docs]},
 
       # Docs
       {:ex_doc, "~> 0.19", only: :docs},
@@ -67,11 +67,27 @@ defmodule EctoSQL.MixProject do
     ]
   end
 
-  defp ecto_opts do
+  defp ecto_dep do
     if path = System.get_env("ECTO_PATH") do
-      [path: path]
+      {:ecto, path: path}
     else
-      []
+      {:ecto, "~> 3.3"}
+    end
+  end
+
+  defp postgrex_dep do
+    if path = System.get_env("POSTGREX_PATH") do
+      {:postgrex, path: path}
+    else
+      {:postgrex, "~> 0.15.0", optional: true}
+    end
+  end
+
+  defp myxql_dep do
+    if path = System.get_env("MYXQL_PATH") do
+      {:myxql, path: path}
+    else
+      {:myxql, "~> 0.3.0", optional: true}
     end
   end
 
@@ -81,7 +97,7 @@ defmodule EctoSQL.MixProject do
   defp package do
     [
       maintainers: ["Eric Meadows-Jönsson", "José Valim", "James Fish", "Michał Muskała"],
-      licenses: ["Apache 2.0"],
+      licenses: ["Apache-2.0"],
       links: %{"GitHub" => "https://github.com/elixir-ecto/ecto_sql"},
       files:
         ~w(.formatter.exs mix.exs README.md CHANGELOG.md lib) ++
@@ -122,7 +138,7 @@ defmodule EctoSQL.MixProject do
         # Ecto.Migrator,
 
         "Built-in adapters": [
-          Ecto.Adapters.MySQL,
+          Ecto.Adapters.MyXQL,
           Ecto.Adapters.Postgres
         ],
         "Adapter specification": [

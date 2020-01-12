@@ -27,6 +27,11 @@ defmodule Ecto.Integration.SQLTest do
     assert result.rows == [[[text1, text2]]]
   end
 
+  test "query!/4 with dynamic repo" do
+    TestRepo.put_dynamic_repo(:unknown)
+    assert_raise RuntimeError, ~r/:unknown/, fn -> TestRepo.query!("SELECT 1") end
+  end
+
   test "query!/4" do
     result = TestRepo.query!("SELECT 1")
     assert result.rows == [[1]]
@@ -113,5 +118,13 @@ defmodule Ecto.Integration.SQLTest do
     result = Ecto.Adapters.SQL.query!(TestRepo, "SELECT * FROM posts", [])
     posts = Enum.map(result.rows, &TestRepo.load(Post, {result.columns, &1}))
     assert [%Post{title: "title1", inserted_at: ^inserted_at, public: false}] = posts
+  end
+
+  test "returns true when table exists" do
+    assert Ecto.Adapters.SQL.table_exists?(TestRepo, "posts")
+  end
+
+  test "returns false table doesn't exists" do
+    refute Ecto.Adapters.SQL.table_exists?(TestRepo, "unknown")
   end
 end

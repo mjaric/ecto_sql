@@ -47,6 +47,14 @@ defmodule Mix.Tasks.Ecto.Gen.Migration do
     * `--no-compile` - does not compile applications before running
     * `--no-deps-check` - does not check depedendencies before running
 
+  ## Configuration
+
+  If the current app configuration specifies a custom migration module
+  the generated migration code will use that rather than the default
+  `Ecto.Migration`:
+
+      config :ecto_sql, migration_module: MyApplication.CustomMigrationModule
+
   """
 
   @impl true
@@ -71,7 +79,7 @@ defmodule Mix.Tasks.Ecto.Gen.Migration do
           assigns = [mod: Module.concat([repo, Migrations, camelize(name)]), change: opts[:change]]
           create_file file, migration_template(assigns)
 
-          if open?(file) and Mix.shell.yes?("Do you want to run this migration?") do
+          if open?(file) and Mix.shell().yes?("Do you want to run this migration?") do
             Mix.Task.run "ecto.migrate", ["-r", inspect(repo)]
           end
 
@@ -92,9 +100,16 @@ defmodule Mix.Tasks.Ecto.Gen.Migration do
   defp pad(i) when i < 10, do: << ?0, ?0 + i >>
   defp pad(i), do: to_string(i)
 
+  defp migration_module do
+    case Application.get_env(:ecto_sql, :migration_module, Ecto.Migration) do
+      migration_module when is_atom(migration_module) -> migration_module
+      other -> Mix.raise "Expected :migration_module to be a module, got: #{inspect(other)}"
+    end
+  end
+
   embed_template :migration, """
   defmodule <%= inspect @mod %> do
-    use Ecto.Migration
+    use <%= inspect migration_module() %>
 
     def change do
   <%= @change %>

@@ -14,10 +14,10 @@ defmodule Ecto.Migration.SchemaMigration do
 
   @opts [timeout: :infinity, log: false]
 
-  def ensure_schema_migrations_table!(repo, prefix) do
+  def ensure_schema_migrations_table!(repo, opts) do
     table_name = repo |> get_source |> String.to_atom()
-    table = %Ecto.Migration.Table{name: table_name, prefix: prefix}
-    meta = Ecto.Adapter.lookup_meta(repo)
+    table = %Ecto.Migration.Table{name: table_name, prefix: opts[:prefix]}
+    meta = Ecto.Adapter.lookup_meta(repo.get_dynamic_repo())
 
     commands = [
       {:add, :version, :bigint, primary_key: true},
@@ -36,7 +36,7 @@ defmodule Ecto.Migration.SchemaMigration do
   def up(repo, version, prefix) do
     %__MODULE__{version: version}
     |> Ecto.put_meta(prefix: prefix, source: get_source(repo))
-    |> repo.insert!(@opts)
+    |> repo.insert(@opts)
   end
 
   def down(repo, version, prefix) do

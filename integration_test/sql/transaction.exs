@@ -27,18 +27,18 @@ defmodule Ecto.Integration.TransactionTest do
   end
 
   test "transaction returns value" do
-    refute PoolRepo.in_transaction?
+    refute PoolRepo.in_transaction?()
     {:ok, val} = PoolRepo.transaction(fn ->
-      assert PoolRepo.in_transaction?
+      assert PoolRepo.in_transaction?()
       {:ok, val} =
         PoolRepo.transaction(fn ->
-          assert PoolRepo.in_transaction?
+          assert PoolRepo.in_transaction?()
           42
         end)
-      assert PoolRepo.in_transaction?
+      assert PoolRepo.in_transaction?()
       val
     end)
-    refute PoolRepo.in_transaction?
+    refute PoolRepo.in_transaction?()
     assert val == 42
   end
 
@@ -187,21 +187,21 @@ defmodule Ecto.Integration.TransactionTest do
   describe "with checkouts" do
     test "transaction inside checkout" do
       PoolRepo.checkout(fn ->
-        refute PoolRepo.in_transaction?
+        refute PoolRepo.in_transaction?()
         PoolRepo.transaction(fn ->
-          assert PoolRepo.in_transaction?
+          assert PoolRepo.in_transaction?()
         end)
-        refute PoolRepo.in_transaction?
+        refute PoolRepo.in_transaction?()
       end)
     end
 
     test "checkout inside transaction" do
       PoolRepo.transaction(fn ->
-        assert PoolRepo.in_transaction?
+        assert PoolRepo.in_transaction?()
         PoolRepo.checkout(fn ->
-          assert PoolRepo.in_transaction?
+          assert PoolRepo.in_transaction?()
         end)
-        assert PoolRepo.in_transaction?
+        assert PoolRepo.in_transaction?()
       end)
     end
 
@@ -215,32 +215,34 @@ defmodule Ecto.Integration.TransactionTest do
   ## Logging
 
   defp register_telemetry() do
-    Process.put(:telemetry, fn _, _, event -> send(self(), event) end)
+    Process.put(:telemetry, fn _, measurements, event -> send(self(), {measurements, event}) end)
   end
 
   test "log begin, commit and rollback" do
     register_telemetry()
+
     PoolRepo.transaction(fn ->
-      assert_received %{params: [], result: {:ok, _}} = entry
-      assert is_integer(entry.query_time) and entry.query_time >= 0
-      assert is_integer(entry.queue_time) and entry.queue_time >= 0
+      assert_received {measurements, %{params: [], result: {:ok, _res}}}
+      assert is_integer(measurements.query_time) and measurements.query_time >= 0
+      assert is_integer(measurements.queue_time) and measurements.queue_time >= 0
 
       refute_received %{}
       register_telemetry()
     end)
 
-    assert_received %{params: [], result: {:ok, _}} = entry
-    assert is_integer(entry.query_time) and entry.query_time >= 0
-    assert is_nil(entry.queue_time)
+    assert_received {measurements, %{params: [], result: {:ok, _res}}}
+    assert is_integer(measurements.query_time) and measurements.query_time >= 0
+    refute Map.has_key?(measurements, :queue_time)
 
     assert PoolRepo.transaction(fn ->
       refute_received %{}
       register_telemetry()
       PoolRepo.rollback(:log_rollback)
     end) == {:error, :log_rollback}
-    assert_received %{params: [], result: {:ok, _}} = entry
-    assert is_integer(entry.query_time) and entry.query_time >= 0
-    assert is_nil(entry.queue_time)
+
+    assert_received {measurements, %{params: [], result: {:ok, _res}}}
+    assert is_integer(measurements.query_time) and measurements.query_time >= 0
+    refute Map.has_key?(measurements, :queue_time)
   end
 
   test "log queries inside transactions" do
@@ -248,10 +250,10 @@ defmodule Ecto.Integration.TransactionTest do
       register_telemetry()
       assert [] = PoolRepo.all(Trans)
 
-      assert_received %{params: [], result: {:ok, _}} = entry
-      assert is_integer(entry.query_time) and entry.query_time >= 0
-      assert is_integer(entry.decode_time) and entry.query_time >= 0
-      assert is_nil(entry.queue_time)
+      assert_received {measurements, %{params: [], result: {:ok, _res}}}
+      assert is_integer(measurements.query_time) and measurements.query_time >= 0
+      assert is_integer(measurements.decode_time) and measurements.query_time >= 0
+      refute Map.has_key?(measurements, :queue_time)
     end)
   end
 end

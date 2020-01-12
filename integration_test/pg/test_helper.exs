@@ -7,7 +7,7 @@ Application.put_env(:ecto_sql, :lock_for_update, "FOR UPDATE")
 
 # Configure PG connection
 Application.put_env(:ecto_sql, :pg_test_url,
-  "ecto://" <> (System.get_env("PG_URL") || "postgres:postgres@localhost")
+  "ecto://" <> (System.get_env("PG_URL") || "postgres:postgres@127.0.0.1")
 )
 
 Code.require_file "../support/repo.exs", __DIR__
@@ -17,7 +17,8 @@ alias Ecto.Integration.TestRepo
 
 Application.put_env(:ecto_sql, TestRepo,
   url: Application.get_env(:ecto_sql, :pg_test_url) <> "/ecto_test",
-  pool: Ecto.Adapters.SQL.Sandbox)
+  pool: Ecto.Adapters.SQL.Sandbox
+)
 
 defmodule Ecto.Integration.TestRepo do
   use Ecto.Integration.Repo, otp_app: :ecto_sql, adapter: Ecto.Adapters.Postgres
@@ -49,7 +50,7 @@ defmodule Ecto.Integration.PoolRepo do
 end
 
 # Load support files
-ecto = Mix.Project.deps_paths[:ecto]
+ecto = Mix.Project.deps_paths()[:ecto]
 Code.require_file "#{ecto}/integration_test/support/schemas.exs", __DIR__
 Code.require_file "../support/migration.exs", __DIR__
 
@@ -64,8 +65,8 @@ end
 {:ok, _} = Ecto.Adapters.Postgres.ensure_all_started(TestRepo.config(), :temporary)
 
 # Load up the repository, start it, and run migrations
-_   = Ecto.Adapters.Postgres.storage_down(TestRepo.config)
-:ok = Ecto.Adapters.Postgres.storage_up(TestRepo.config)
+_   = Ecto.Adapters.Postgres.storage_down(TestRepo.config())
+:ok = Ecto.Adapters.Postgres.storage_up(TestRepo.config())
 
 {:ok, _pid} = TestRepo.start_link()
 {:ok, _pid} = PoolRepo.start_link()
@@ -79,11 +80,18 @@ version =
     _other -> version
   end
 
-if Version.match?(version, ">= 9.5.0") do
-  ExUnit.configure(exclude: [:without_conflict_target])
-else
-  Application.put_env(:ecto_sql, :postgres_map_type, "json")
-  ExUnit.configure(exclude: [:upsert, :upsert_all, :array_type, :aggregate_filters])
+excludes_above_9_5 = [:without_conflict_target]
+excludes_below_9_5 = [:upsert, :upsert_all, :array_type, :aggregate_filters]
+excludes_below_9_6 = [:add_column_if_not_exists, :no_error_on_conditional_column_migration]
+
+cond do
+  Version.match?(version, "< 9.5.0") ->
+    ExUnit.configure(exclude: excludes_below_9_5 ++ excludes_below_9_6)
+    Application.put_env(:ecto_sql, :postgres_map_type, "json")
+  Version.match?(version, ">= 9.5.0") and Version.match?(version, "< 9.6.0") ->
+    ExUnit.configure(exclude: excludes_above_9_5 ++ excludes_below_9_6)
+  true ->
+    ExUnit.configure(exclude: excludes_above_9_5)
 end
 
 :ok = Ecto.Migrator.up(TestRepo, 0, Ecto.Integration.Migration, log: false)
