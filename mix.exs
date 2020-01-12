@@ -53,7 +53,7 @@ defmodule EctoSQL.MixProject do
       {:db_connection, "~> 2.2"},
       postgrex_dep(),
       myxql_dep(),
-      {:tds, "~> 2.0", optional: true},
+      tds_dep(),
 
       # Bring something in for JSON during tests
       {:jason, ">= 0.0.0", only: [:test, :docs]},
@@ -88,6 +88,14 @@ defmodule EctoSQL.MixProject do
       {:myxql, path: path}
     else
       {:myxql, "~> 0.3.0", optional: true}
+    end
+  end
+
+  defp tds_dep do
+    if path = System.get_env("TDS_PATH") do
+      {:tds, path: path}
+    else
+      {:tds, "~> 2.0", optional: true}
     end
   end
 
